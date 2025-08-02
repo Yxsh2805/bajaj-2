@@ -61,10 +61,14 @@ class OptimizedRAGEngine:
         logger.info("Initializing optimized RAG engine...")
         
         # Set environment variables
-        os.environ["TOGETHER_API_KEY"] = "deb14836869b48e01e1853f49381b9eb7885e231ead3bc4f6bbb4a5fc4570b78"
-        os.environ["LANGCHAIN_TRACING_V2"] = "true"
-        os.environ["LANGCHAIN_API_KEY"] = "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"
-        os.environ["LANGCHAIN_PROJECT"] = "chunking and rag bajaj"
+        # os.environ["TOGETHER_API_KEY"] = "deb14836869b48e01e1853f49381b9eb7885e231ead3bc4f6bbb4a5fc4570b78"
+        # os.environ["LANGCHAIN_TRACING_V2"] = "true"
+        # os.environ["LANGCHAIN_API_KEY"] = "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"
+        # os.environ["LANGCHAIN_PROJECT"] = "chunking and rag bajaj"
+        together_api_key = os.getenv("TOGETHER_API_KEY")
+        langchain_api_key = os.getenv("LANGCHAIN_API_KEY")
+        langchain_tracing_v2 = os.getenv("true")
+        langchin_project = os.getenv("chunking and rag bajaj")
 
         # Initialize LLM and embeddings with optimized settings
         self.chat_model = ChatTogether(
@@ -76,13 +80,12 @@ class OptimizedRAGEngine:
 
         # Initialize persistent client with optimized settings
         self.persistent_client = chromadb.PersistentClient(
-            path="/content/vectorstore_optimized",
+            path="./vectorstore_data",  # Relative path is better
             settings=chromadb.Settings(
                 anonymized_telemetry=False,
                 allow_reset=True
             )
         )
-
         # Optimized text splitter
         self.text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=800,  # Larger chunks = fewer embeddings
@@ -358,8 +361,3 @@ async def clear_cache(authorization: str = Depends(verify_token)):
     except Exception as e:
         logger.error(f"Cache clear error: {str(e)}")
         raise HTTPException(status_code=500, detail="Failed to clear cache")
-
-# ----- For Local Testing -----
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
