@@ -60,32 +60,59 @@ class OptimizedRAGEngine:
             
         logger.info("Initializing optimized RAG engine...")
         
-        # Set environment variables
-        # os.environ["TOGETHER_API_KEY"] = "deb14836869b48e01e1853f49381b9eb7885e231ead3bc4f6bbb4a5fc4570b78"
-        # os.environ["LANGCHAIN_TRACING_V2"] = "true"
-        # os.environ["LANGCHAIN_API_KEY"] = "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"
-        # os.environ["LANGCHAIN_PROJECT"] = "chunking and rag bajaj"
+        # Load and validate environment variables
         together_api_key = os.getenv("TOGETHER_API_KEY")
         langchain_api_key = os.getenv("LANGCHAIN_API_KEY")
-        langchain_tracing_v2 = os.getenv("true")
-        langchin_project = os.getenv("chunking and rag bajaj")
+        langchain_tracing_v2 = os.getenv("LANGCHAIN_TRACING_V2", "false")
+        langchain_project = os.getenv("LANGCHAIN_PROJECT", "rag-project")
 
-        # Initialize LLM and embeddings with optimized settings
-        self.chat_model = ChatTogether(
-            model="meta-llama/Llama-3.3-70B-Instruct-Turbo-Free",
-            temperature=0,  # Consistent outputs
-            max_tokens=4000  # Reasonable limit
-        )
-        self.embeddings = TogetherEmbeddings(model="BAAI/bge-base-en-v1.5")
+        # Validate required API keys
+        if not together_api_key:
+            raise ValueError("TOGETHER_API_KEY environment variable is required")
+        if not langchain_api_key:
+            raise ValueError("LANGCHAIN_API_KEY environment variable is required")
 
-        # Initialize persistent client with optimized settings
-        self.persistent_client = chromadb.PersistentClient(
-            path="./vectorstore_data",  # Relative path is better
-            settings=chromadb.Settings(
-                anonymized_telemetry=False,
-                allow_reset=True
+        # Set environment variables for the libraries to use
+        os.environ["TOGETHER_API_KEY"] = together_api_key
+        os.environ["LANGCHAIN_TRACING_V2"] = langchain_tracing_v2
+        os.environ["LANGCHAIN_API_KEY"] = langchain_api_key
+        os.environ["LANGCHAIN_PROJECT"] = langchain_project
+
+        logger.info("Environment variables loaded and validated successfully")
+
+        try:
+            # Initialize LLM and embeddings with optimized settings
+            self.chat_model = ChatTogether(
+                model="meta-llama/Llama-3.3-70B-Instruct-Turbo-Free",
+                temperature=0,  # Consistent outputs
+                max_tokens=4000  # Reasonable limit
             )
-        )
+            self.embeddings = TogetherEmbeddings(model="BAAI/bge-base-en-v1.5")
+            logger.info("LLM and embeddings initialized successfully")
+
+        except Exception as e:
+            logger.error(f"Failed to initialize LLM/embeddings: {str(e)}")
+            raise
+
+        try:
+            # Create vectorstore directory if it doesn't exist
+            vectorstore_path = "./vectorstore_data"
+            os.makedirs(vectorstore_path, exist_ok=True)
+            
+            # Initialize persistent client with optimized settings
+            self.persistent_client = chromadb.PersistentClient(
+                path=vectorstore_path,
+                settings=chromadb.Settings(
+                    anonymized_telemetry=False,
+                    allow_reset=True
+                )
+            )
+            logger.info("ChromaDB client initialized successfully")
+
+        except Exception as e:
+            logger.error(f"Failed to initialize ChromaDB: {str(e)}")
+            raise
+
         # Optimized text splitter
         self.text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=800,  # Larger chunks = fewer embeddings
@@ -141,24 +168,29 @@ Context: {context}"""),
         logger.info(f"Loading document: {url}")
         start_time = time.time()
         
-        # Load document
-        loader = UnstructuredURLLoader(urls=[url])
-        docs = loader.load()
-        
-        # Split into chunks
-        chunks = self.text_splitter.split_documents(docs)
-        
-        load_time = time.time() - start_time
-        logger.info(f"Document loaded and chunked in {load_time:.2f}s ({len(chunks)} chunks)")
-        
-        # Cache the result (limit cache size)
-        if len(self.document_cache) >= self.max_cache_size:
-            # Remove oldest entry
-            oldest_key = next(iter(self.document_cache))
-            del self.document_cache[oldest_key]
-        
-        self.document_cache[url] = (docs, chunks)
-        return docs, chunks
+        try:
+            # Load document
+            loader = UnstructuredURLLoader(urls=[url])
+            docs = loader.load()
+            
+            # Split into chunks
+            chunks = self.text_splitter.split_documents(docs)
+            
+            load_time = time.time() - start_time
+            logger.info(f"Document loaded and chunked in {load_time:.2f}s ({len(chunks)} chunks)")
+            
+            # Cache the result (limit cache size)
+            if len(self.document_cache) >= self.max_cache_size:
+                # Remove oldest entry
+                oldest_key = next(iter(self.document_cache))
+                del self.document_cache[oldest_key]
+            
+            self.document_cache[url] = (docs, chunks)
+            return docs, chunks
+            
+        except Exception as e:
+            logger.error(f"Failed to load document from {url}: {str(e)}")
+            raise
 
     def _create_or_get_vectorstore(self, url: str, chunks: List) -> tuple:
         """Create vectorstore with optimized batch processing"""
@@ -182,39 +214,45 @@ Context: {context}"""),
         logger.info(f"Creating new vectorstore: {collection_name}")
         start_time = time.time()
         
-        # Create fresh vectorstore
-        vectorstore = Chroma(
-            client=self.persistent_client,
-            collection_name=collection_name,
-            embedding_function=self.embeddings,
-        )
-        
-        # Optimized batch insertion
-        batch_size = 50  # Process in batches
-        total_chunks = len(chunks)
-        
-        def add_batch(batch_chunks):
-            vectorstore.add_documents(batch_chunks)
-        
-        # Process chunks in parallel batches
-        with ThreadPoolExecutor(max_workers=4) as executor:  # Reduced workers
-            futures = []
-            for i in range(0, total_chunks, batch_size):
-                batch = chunks[i:i + batch_size]
-                future = executor.submit(add_batch, batch)
-                futures.append(future)
+        try:
+            # Create fresh vectorstore
+            vectorstore = Chroma(
+                client=self.persistent_client,
+                collection_name=collection_name,
+                embedding_function=self.embeddings,
+            )
             
-            # Wait for all batches to complete
-            for future in as_completed(futures):
-                try:
-                    future.result()
-                except Exception as e:
-                    logger.error(f"Batch processing error: {e}")
-        
-        creation_time = time.time() - start_time
-        logger.info(f"Vectorstore created in {creation_time:.2f}s")
-        
-        return vectorstore, True  # True = newly created
+            # Optimized batch insertion
+            batch_size = 50  # Process in batches
+            total_chunks = len(chunks)
+            
+            def add_batch(batch_chunks):
+                vectorstore.add_documents(batch_chunks)
+            
+            # Process chunks in parallel batches
+            with ThreadPoolExecutor(max_workers=2) as executor:  # Reduced for deployment
+                futures = []
+                for i in range(0, total_chunks, batch_size):
+                    batch = chunks[i:i + batch_size]
+                    future = executor.submit(add_batch, batch)
+                    futures.append(future)
+                
+                # Wait for all batches to complete
+                for future in as_completed(futures):
+                    try:
+                        future.result()
+                    except Exception as e:
+                        logger.error(f"Batch processing error: {e}")
+                        raise
+            
+            creation_time = time.time() - start_time
+            logger.info(f"Vectorstore created in {creation_time:.2f}s")
+            
+            return vectorstore, True  # True = newly created
+            
+        except Exception as e:
+            logger.error(f"Failed to create vectorstore: {str(e)}")
+            raise
 
     def process_document_questions(self, url: str, questions: List[str]) -> List[str]:
         """Optimized document processing and question answering"""
