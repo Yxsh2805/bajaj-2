@@ -2,23 +2,38 @@ import os
 import time
 import logging
 import hashlib
+import requests
 from datetime import datetime
 from typing import List, Optional, Dict, Any
 from contextlib import asynccontextmanager
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from io import BytesIO
 
 from fastapi import FastAPI, HTTPException, Header, Depends
 from pydantic import BaseModel
 
 # RAG imports
 from langchain_together import ChatTogether, TogetherEmbeddings
-from langchain_community.document_loaders import UnstructuredURLLoader
+from langchain_community.document_loaders import PyPDFLoader, UnstructuredURLLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import RunnableAssign, RunnableLambda
+from langchain_core.documents import Document
 import chromadb
 from langchain_chroma import Chroma
+
+# PDF processing
+try:
+    import PyPDF2
+    PDF_SUPPORT = True
+except ImportError:
+    PDF_SUPPORT = False
+    
+try:
+    from pdfplumber import PDF
+    PDFPLUMBER_SUPPORT = True
+except ImportError:
+    PDFPLUMBER_SUPPORT = False
 
 # Set up logging
 logging.basicConfig(
@@ -38,8 +53,8 @@ class QuestionRequest(BaseModel):
 class AnswerResponse(BaseModel):
     answers: List[str]
 
-# ----- Simplified RAG Engine -----
-class SimpleRAGEngine:
+# ----- Enhanced RAG Engine with PDF Support -----
+class EnhancedRAGEngine:
     def __init__(self):
         self.chat_model = None
         self.embeddings = None
@@ -50,7 +65,7 @@ class SimpleRAGEngine:
         
         # Simplified caching
         self.document_cache: Dict[str, Any] = {}
-        self.max_cache_size = 3  # Reduced for Railway limits
+        self.max_cache_size = 3
     
     def _get_url_hash(self, url: str) -> str:
         """Generate hash for URL for caching purposes"""
@@ -61,9 +76,9 @@ class SimpleRAGEngine:
         if self.initialized:
             return
             
-        logger.info("Initializing RAG engine...")
+        logger.info("Initializing Enhanced RAG engine...")
         
-        # Get environment variables with defaults
+        # Get environment variables
         together_api_key = os.getenv("TOGETHER_API_KEY")
         langchain_api_key = os.getenv("LANGCHAIN_API_KEY")
         
@@ -91,7 +106,7 @@ class SimpleRAGEngine:
             raise
 
         try:
-            # Use in-memory ChromaDB for Railway (ephemeral storage)
+            # Use in-memory ChromaDB for Railway
             self.persistent_client = chromadb.Client()
             logger.info("ChromaDB client initialized (in-memory)")
 
@@ -108,21 +123,55 @@ class SimpleRAGEngine:
 
         # Prompt template
         self.policy_prompt = ChatPromptTemplate([
-            ("system", """You are an expert assistant. Answer questions accurately and concisely.
+            ("system", """You are an expert insurance policy assistant. Answer questions accurately and concisely based on the provided policy document.
 
 FORMAT: Input questions are separated by " | ". Output answers MUST be separated by " | " in the same order.
 
 Guidelines:
-- Give direct, clear answers
-- Use information from the context
-- If unsure, state limitations
-- Maintain exact order and use " | " separator"""),
+- Give direct, clear answers based on the policy document
+- Cite specific policy terms when available
+- If information is not found in the document, state "Information not found in the policy document"
+- Maintain exact order and use " | " separator between answers
+- Be specific about waiting periods, coverage limits, and conditions"""),
             ("human", """Questions: {query}
-Context: {context}"""),
+Policy Document Context: {context}"""),
         ])
 
         self.initialized = True
-        logger.info("RAG engine initialized successfully")
+        logger.info("Enhanced RAG engine initialized successfully")
+
+    def _download_pdf_content(self, url: str) -> str:
+        """Download and extract text from PDF URL"""
+        try:
+            logger.info(f"Downloading PDF from: {url}")
+            response = requests.get(url, timeout=30)
+            response.raise_for_status()
+            
+            # Try PyPDF2 first
+            if PDF_SUPPORT:
+                try:
+                    pdf_file = BytesIO(response.content)
+                    pdf_reader = PyPDF2.PdfReader(pdf_file)
+                    text = ""
+                    for page in pdf_reader.pages:
+                        text += page.extract_text() + "\n"
+                    if text.strip():
+                        logger.info(f"Successfully extracted text using PyPDF2 ({len(text)} characters)")
+                        return text
+                except Exception as e:
+                    logger.warning(f"PyPDF2 extraction failed: {e}")
+            
+            # Fallback: Try to use requests to get content and treat as text
+            logger.info("Attempting fallback text extraction...")
+            content = response.content.decode('utf-8', errors='ignore')
+            if len(content) > 100:  # Basic check for valid content
+                return content
+                
+            raise Exception("No suitable PDF extraction method available")
+            
+        except Exception as e:
+            logger.error(f"Failed to download/extract PDF: {e}")
+            raise
 
     def build_chain(self, retriever):
         """Build RAG chain"""
@@ -140,7 +189,7 @@ Context: {context}"""),
         )
 
     def _load_document(self, url: str):
-        """Load and process document"""
+        """Load and process document (PDF or web page)"""
         url_hash = self._get_url_hash(url)
         
         # Check cache
@@ -151,18 +200,31 @@ Context: {context}"""),
         logger.info(f"Loading document: {url}")
         
         try:
-            # Load document
-            loader = UnstructuredURLLoader(urls=[url])
-            docs = loader.load()
-            
-            # Split into chunks
-            chunks = self.text_splitter.split_documents(docs)
+            # Check if it's a PDF URL
+            if url.lower().endswith('.pdf') or 'pdf' in url.lower():
+                # Handle PDF
+                text_content = self._download_pdf_content(url)
+                # Create document object
+                doc = Document(page_content=text_content, metadata={"source": url})
+                chunks = self.text_splitter.split_documents([doc])
+            else:
+                # Handle web pages - try unstructured first, fallback to requests
+                try:
+                    loader = UnstructuredURLLoader(urls=[url])
+                    docs = loader.load()
+                    chunks = self.text_splitter.split_documents(docs)
+                except Exception as e:
+                    logger.warning(f"UnstructuredURLLoader failed: {e}, trying requests fallback")
+                    # Fallback to simple requests
+                    response = requests.get(url, timeout=30)
+                    response.raise_for_status()
+                    doc = Document(page_content=response.text, metadata={"source": url})
+                    chunks = self.text_splitter.split_documents([doc])
             
             logger.info(f"Document loaded ({len(chunks)} chunks)")
             
             # Simple cache management
             if len(self.document_cache) >= self.max_cache_size:
-                # Remove first entry (FIFO)
                 oldest_key = next(iter(self.document_cache))
                 del self.document_cache[oldest_key]
             
@@ -171,7 +233,7 @@ Context: {context}"""),
             
         except Exception as e:
             logger.error(f"Failed to load document from {url}: {str(e)}")
-            raise
+            raise HTTPException(status_code=400, detail=f"Failed to load document: {str(e)}")
 
     def _create_vectorstore(self, chunks: List, collection_name: str):
         """Create vectorstore"""
@@ -192,7 +254,7 @@ Context: {context}"""),
             )
             
             # Add documents in batches
-            batch_size = 20
+            batch_size = 10  # Reduced for Railway memory limits
             for i in range(0, len(chunks), batch_size):
                 batch = chunks[i:i + batch_size]
                 vectorstore.add_documents(batch)
@@ -213,6 +275,9 @@ Context: {context}"""),
             # Load document
             chunks = self._load_document(url)
             
+            if not chunks:
+                raise HTTPException(status_code=400, detail="No content extracted from document")
+            
             # Create unique collection name
             url_hash = self._get_url_hash(url)
             collection_name = f"doc_{url_hash}_{int(time.time())}"
@@ -223,7 +288,7 @@ Context: {context}"""),
             # Create retriever
             retriever = vectorstore.as_retriever(
                 search_type="similarity",
-                search_kwargs={"k": 4}
+                search_kwargs={"k": 5}
             )
             
             # Build chain
@@ -255,12 +320,14 @@ Context: {context}"""),
             
             return answers
 
+        except HTTPException:
+            raise
         except Exception as e:
             logger.error(f"Error processing questions: {str(e)}")
-            raise
+            raise HTTPException(status_code=500, detail=f"Processing error: {str(e)}")
 
 # Global RAG engine instance
-rag_engine = SimpleRAGEngine()
+rag_engine = EnhancedRAGEngine()
 
 # ----- Token Verifier -----
 def verify_token(authorization: Optional[str] = Header(None)):
@@ -289,8 +356,8 @@ async def lifespan(app: FastAPI):
 
 # ----- FastAPI App -----
 app = FastAPI(
-    title="RAG Question Answering API",
-    version="2.1.0",
+    title="Enhanced RAG Question Answering API",
+    version="2.2.0",
     lifespan=lifespan
 )
 
@@ -307,7 +374,7 @@ async def ask_questions(
             raise HTTPException(status_code=400, detail="Invalid document URL")
         if not request.questions:
             raise HTTPException(status_code=400, detail="Questions list is empty")
-        if len(request.questions) > 10:  # Limit for Railway
+        if len(request.questions) > 10:
             raise HTTPException(status_code=400, detail="Too many questions (max 10)")
 
         # Process questions
@@ -328,13 +395,14 @@ async def health_check():
         "status": "healthy",
         "initialized": rag_engine.initialized,
         "cached_docs": len(rag_engine.document_cache),
+        "pdf_support": PDF_SUPPORT,
         "timestamp": datetime.now().isoformat()
     }
 
 @app.get("/")
 async def root():
     """Root endpoint"""
-    return {"message": "RAG API is running", "version": "2.1.0"}
+    return {"message": "Enhanced RAG API is running", "version": "2.2.0", "pdf_support": PDF_SUPPORT}
 
 if __name__ == "__main__":
     import uvicorn
