@@ -4,6 +4,7 @@ import logging
 import hashlib
 from datetime import datetime
 from typing import List, Optional, Dict, Any
+from contextlib import asynccontextmanager
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from fastapi import FastAPI, HTTPException, Header, Depends
@@ -20,11 +21,14 @@ import chromadb
 from langchain_chroma import Chroma
 
 # Set up logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 # Expected Bearer token for authentication
-EXPECTED_TOKEN = "5aa05ad358e859e92978582cde20423149f28beb49da7a2bbb487afa8fce1be8"
+EXPECTED_TOKEN = os.getenv("API_TOKEN", "5aa05ad358e859e92978582cde20423149f28beb49da7a2bbb487afa8fce1be8")
 
 # ----- Request/Response Models -----
 class QuestionRequest(BaseModel):
@@ -34,8 +38,8 @@ class QuestionRequest(BaseModel):
 class AnswerResponse(BaseModel):
     answers: List[str]
 
-# ----- Optimized RAG Engine -----
-class OptimizedRAGEngine:
+# ----- Simplified RAG Engine -----
+class SimpleRAGEngine:
     def __init__(self):
         self.chat_model = None
         self.embeddings = None
@@ -44,110 +48,89 @@ class OptimizedRAGEngine:
         self.policy_prompt = None
         self.initialized = False
         
-        # Caching for optimization
-        self.document_cache: Dict[str, Any] = {}  # URL -> processed document data
-        self.vectorstore_cache: Dict[str, Any] = {}  # URL hash -> vectorstore info
-        self.max_cache_size = 5  # Keep last 5 documents in memory
+        # Simplified caching
+        self.document_cache: Dict[str, Any] = {}
+        self.max_cache_size = 3  # Reduced for Railway limits
     
     def _get_url_hash(self, url: str) -> str:
         """Generate hash for URL for caching purposes"""
-        return hashlib.md5(url.encode()).hexdigest()[:12]
+        return hashlib.md5(url.encode()).hexdigest()[:8]
     
     def initialize(self):
-        """Initialize RAG components once at startup"""
+        """Initialize RAG components"""
         if self.initialized:
             return
             
-        logger.info("Initializing optimized RAG engine...")
+        logger.info("Initializing RAG engine...")
         
-        # Load and validate environment variables
+        # Get environment variables with defaults
         together_api_key = os.getenv("TOGETHER_API_KEY")
         langchain_api_key = os.getenv("LANGCHAIN_API_KEY")
-        langchain_tracing_v2 = os.getenv("LANGCHAIN_TRACING_V2", "false")
-        langchain_project = os.getenv("LANGCHAIN_PROJECT", "rag-project")
-
-        # Validate required API keys
+        
         if not together_api_key:
             raise ValueError("TOGETHER_API_KEY environment variable is required")
         if not langchain_api_key:
             raise ValueError("LANGCHAIN_API_KEY environment variable is required")
 
-        # Set environment variables for the libraries to use
-        os.environ["TOGETHER_API_KEY"] = together_api_key
-        os.environ["LANGCHAIN_TRACING_V2"] = langchain_tracing_v2
-        os.environ["LANGCHAIN_API_KEY"] = langchain_api_key
-        os.environ["LANGCHAIN_PROJECT"] = langchain_project
-
-        logger.info("Environment variables loaded and validated successfully")
+        # Set environment variables
+        os.environ["LANGCHAIN_TRACING_V2"] = os.getenv("LANGCHAIN_TRACING_V2", "false")
+        os.environ["LANGCHAIN_PROJECT"] = os.getenv("LANGCHAIN_PROJECT", "rag-railway")
 
         try:
-            # Initialize LLM and embeddings with optimized settings
+            # Initialize LLM and embeddings
             self.chat_model = ChatTogether(
                 model="meta-llama/Llama-3.3-70B-Instruct-Turbo-Free",
-                temperature=0,  # Consistent outputs
-                max_tokens=4000  # Reasonable limit
+                temperature=0,
+                max_tokens=3000
             )
             self.embeddings = TogetherEmbeddings(model="BAAI/bge-base-en-v1.5")
-            logger.info("LLM and embeddings initialized successfully")
+            logger.info("LLM and embeddings initialized")
 
         except Exception as e:
             logger.error(f"Failed to initialize LLM/embeddings: {str(e)}")
             raise
 
         try:
-            # Create vectorstore directory if it doesn't exist
-            vectorstore_path = "./vectorstore_data"
-            os.makedirs(vectorstore_path, exist_ok=True)
-            
-            # Initialize persistent client with optimized settings
-            self.persistent_client = chromadb.PersistentClient(
-                path=vectorstore_path,
-                settings=chromadb.Settings(
-                    anonymized_telemetry=False,
-                    allow_reset=True
-                )
-            )
-            logger.info("ChromaDB client initialized successfully")
+            # Use in-memory ChromaDB for Railway (ephemeral storage)
+            self.persistent_client = chromadb.Client()
+            logger.info("ChromaDB client initialized (in-memory)")
 
         except Exception as e:
             logger.error(f"Failed to initialize ChromaDB: {str(e)}")
             raise
 
-        # Optimized text splitter
+        # Text splitter
         self.text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=800,  # Larger chunks = fewer embeddings
-            chunk_overlap=100,  # Reduced overlap
-            separators=["\n\n", "\n", ". ", " ", ""]
+            chunk_size=600,
+            chunk_overlap=50,
+            separators=["\n\n", "\n", ". ", " "]
         )
 
-        # Optimized prompt template for batch processing
+        # Prompt template
         self.policy_prompt = ChatPromptTemplate([
-            ("system", """You are an expert insurance policy assistant. Answer questions concisely and accurately.
+            ("system", """You are an expert assistant. Answer questions accurately and concisely.
 
-CRITICAL FORMAT: Input questions are separated by " | ". Output answers MUST be separated by " | " in the same order.
+FORMAT: Input questions are separated by " | ". Output answers MUST be separated by " | " in the same order.
 
 Guidelines:
-- Direct, concise answers
-- Lead with key information
-- Cite specific policy terms when available
-- If unsure, state limitations clearly
-- Maintain exact order and use " | " separator between answers"""),
+- Give direct, clear answers
+- Use information from the context
+- If unsure, state limitations
+- Maintain exact order and use " | " separator"""),
             ("human", """Questions: {query}
 Context: {context}"""),
         ])
 
         self.initialized = True
-        logger.info("Optimized RAG engine initialized successfully")
+        logger.info("RAG engine initialized successfully")
 
     def build_chain(self, retriever):
-        """Build optimized RAG chain"""
+        """Build RAG chain"""
         def retrieve(state):
             query = state["query"]
-            # Retrieve more relevant chunks but limit processing
-            results = retriever.invoke(query, k=8)  # Limit to top 8 most relevant
-            # Concatenate with length limit to avoid token overflow
+            results = retriever.invoke(query)
             context = " ".join([doc.page_content for doc in results])
-            return context[:4000]  # Limit context length
+            return context[:3000]  # Limit context length
         
         return (
             RunnableAssign({"context": RunnableLambda(retrieve)}) |
@@ -156,17 +139,16 @@ Context: {context}"""),
             StrOutputParser()
         )
 
-    def _load_and_process_document(self, url: str) -> tuple:
-        """Load and process document with caching"""
+    def _load_document(self, url: str):
+        """Load and process document"""
         url_hash = self._get_url_hash(url)
         
-        # Check if document is already cached
+        # Check cache
         if url in self.document_cache:
             logger.info(f"Using cached document for {url}")
             return self.document_cache[url]
         
         logger.info(f"Loading document: {url}")
-        start_time = time.time()
         
         try:
             # Load document
@@ -176,178 +158,141 @@ Context: {context}"""),
             # Split into chunks
             chunks = self.text_splitter.split_documents(docs)
             
-            load_time = time.time() - start_time
-            logger.info(f"Document loaded and chunked in {load_time:.2f}s ({len(chunks)} chunks)")
+            logger.info(f"Document loaded ({len(chunks)} chunks)")
             
-            # Cache the result (limit cache size)
+            # Simple cache management
             if len(self.document_cache) >= self.max_cache_size:
-                # Remove oldest entry
+                # Remove first entry (FIFO)
                 oldest_key = next(iter(self.document_cache))
                 del self.document_cache[oldest_key]
             
-            self.document_cache[url] = (docs, chunks)
-            return docs, chunks
+            self.document_cache[url] = chunks
+            return chunks
             
         except Exception as e:
             logger.error(f"Failed to load document from {url}: {str(e)}")
             raise
 
-    def _create_or_get_vectorstore(self, url: str, chunks: List) -> tuple:
-        """Create vectorstore with optimized batch processing"""
-        url_hash = self._get_url_hash(url)
-        collection_name = f"doc_{url_hash}"
-        
-        # Check if vectorstore already exists and is valid
-        try:
-            existing_collection = self.persistent_client.get_collection(collection_name)
-            if existing_collection.count() > 0:
-                logger.info(f"Reusing existing vectorstore: {collection_name}")
-                vectorstore = Chroma(
-                    client=self.persistent_client,
-                    collection_name=collection_name,
-                    embedding_function=self.embeddings,
-                )
-                return vectorstore, False  # False = not newly created
-        except Exception:
-            pass  # Collection doesn't exist, create new one
-        
-        logger.info(f"Creating new vectorstore: {collection_name}")
-        start_time = time.time()
+    def _create_vectorstore(self, chunks: List, collection_name: str):
+        """Create vectorstore"""
+        logger.info(f"Creating vectorstore: {collection_name}")
         
         try:
-            # Create fresh vectorstore
+            # Create collection
+            collection = self.persistent_client.create_collection(
+                name=collection_name,
+                get_or_create=True
+            )
+            
+            # Create vectorstore
             vectorstore = Chroma(
                 client=self.persistent_client,
                 collection_name=collection_name,
                 embedding_function=self.embeddings,
             )
             
-            # Optimized batch insertion
-            batch_size = 50  # Process in batches
-            total_chunks = len(chunks)
+            # Add documents in batches
+            batch_size = 20
+            for i in range(0, len(chunks), batch_size):
+                batch = chunks[i:i + batch_size]
+                vectorstore.add_documents(batch)
             
-            def add_batch(batch_chunks):
-                vectorstore.add_documents(batch_chunks)
-            
-            # Process chunks in parallel batches
-            with ThreadPoolExecutor(max_workers=2) as executor:  # Reduced for deployment
-                futures = []
-                for i in range(0, total_chunks, batch_size):
-                    batch = chunks[i:i + batch_size]
-                    future = executor.submit(add_batch, batch)
-                    futures.append(future)
-                
-                # Wait for all batches to complete
-                for future in as_completed(futures):
-                    try:
-                        future.result()
-                    except Exception as e:
-                        logger.error(f"Batch processing error: {e}")
-                        raise
-            
-            creation_time = time.time() - start_time
-            logger.info(f"Vectorstore created in {creation_time:.2f}s")
-            
-            return vectorstore, True  # True = newly created
+            logger.info("Vectorstore created successfully")
+            return vectorstore
             
         except Exception as e:
             logger.error(f"Failed to create vectorstore: {str(e)}")
             raise
 
-    def process_document_questions(self, url: str, questions: List[str]) -> List[str]:
-        """Optimized document processing and question answering"""
+    def process_questions(self, url: str, questions: List[str]) -> List[str]:
+        """Process document and answer questions"""
         if not self.initialized:
             raise RuntimeError("RAG engine not initialized")
         
-        total_start_time = time.time()
-        
         try:
-            # Step 1: Load and process document (with caching)
-            docs, chunks = self._load_and_process_document(url)
+            # Load document
+            chunks = self._load_document(url)
             
-            # Step 2: Create or reuse vectorstore
-            vectorstore, is_new = self._create_or_get_vectorstore(url, chunks)
+            # Create unique collection name
+            url_hash = self._get_url_hash(url)
+            collection_name = f"doc_{url_hash}_{int(time.time())}"
             
-            # Step 3: Create retriever with optimized settings
+            # Create vectorstore
+            vectorstore = self._create_vectorstore(chunks, collection_name)
+            
+            # Create retriever
             retriever = vectorstore.as_retriever(
                 search_type="similarity",
-                search_kwargs={"k": 6}  # Retrieve top 6 most relevant chunks
+                search_kwargs={"k": 4}
             )
             
-            # Step 4: Build chain
+            # Build chain
             rag_chain = self.build_chain(retriever)
             
-            # Step 5: Process all questions in batch
-            logger.info(f"Processing {len(questions)} questions in batch...")
+            # Process questions
+            logger.info(f"Processing {len(questions)} questions")
             batch_query = " | ".join(questions)
             
-            query_start_time = time.time()
             batch_result = rag_chain.invoke({"query": batch_query})
-            query_time = time.time() - query_start_time
             
-            logger.info(f"LLM query completed in {query_time:.2f}s")
-            
-            # Step 6: Parse results
+            # Parse results
             answers = [answer.strip() for answer in batch_result.split(" | ")]
             
-            # Validate answer count
+            # Ensure answer count matches question count
             if len(answers) != len(questions):
-                logger.warning(f"Answer count mismatch: {len(questions)} questions, {len(answers)} answers")
+                logger.warning("Answer count mismatch, adjusting...")
                 while len(answers) < len(questions):
-                    answers.append("Unable to generate answer for this question.")
+                    answers.append("Unable to generate answer.")
                 answers = answers[:len(questions)]
             
-            total_time = time.time() - total_start_time
-            logger.info(f"Total processing time: {total_time:.2f}s")
+            logger.info(f"Successfully processed {len(answers)} answers")
+            
+            # Cleanup
+            try:
+                self.persistent_client.delete_collection(collection_name)
+            except:
+                pass  # Ignore cleanup errors
             
             return answers
 
         except Exception as e:
-            logger.error(f"Error processing document: {str(e)}")
+            logger.error(f"Error processing questions: {str(e)}")
             raise
 
-    def cleanup_old_collections(self, keep_recent: int = 3):
-        """Clean up old collections to free memory"""
-        try:
-            collections = self.persistent_client.list_collections()
-            if len(collections) > keep_recent:
-                # Sort by name (which includes timestamp) and keep most recent
-                sorted_collections = sorted(collections, key=lambda x: x.name, reverse=True)
-                to_delete = sorted_collections[keep_recent:]
-                
-                for collection in to_delete:
-                    try:
-                        self.persistent_client.delete_collection(collection.name)
-                        logger.info(f"Cleaned up old collection: {collection.name}")
-                    except Exception as e:
-                        logger.warning(f"Failed to delete collection {collection.name}: {e}")
-        except Exception as e:
-            logger.warning(f"Cleanup failed: {e}")
-
 # Global RAG engine instance
-rag_engine = OptimizedRAGEngine()
+rag_engine = SimpleRAGEngine()
 
 # ----- Token Verifier -----
 def verify_token(authorization: Optional[str] = Header(None)):
     if authorization is None or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Authorization header missing or invalid format")
+        raise HTTPException(status_code=401, detail="Authorization header missing")
     
     token = authorization.split("Bearer ")[-1]
     if token != EXPECTED_TOKEN:
-        raise HTTPException(status_code=403, detail="Invalid Bearer token")
+        raise HTTPException(status_code=403, detail="Invalid token")
 
-# ----- FastAPI App -----
-app = FastAPI(title="Optimized RAG Question Answering API", version="2.0.0")
-
-@app.on_event("startup")
-async def startup_event():
-    """Initialize RAG engine on startup"""
+# ----- Lifespan Event Handler -----
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
     try:
         rag_engine.initialize()
-        logger.info("Optimized application startup completed successfully")
+        logger.info("Application startup completed")
     except Exception as e:
-        logger.error(f"Failed to initialize RAG engine: {str(e)}")
+        logger.error(f"Failed to initialize: {str(e)}")
         raise
+    
+    yield
+    
+    # Shutdown
+    logger.info("Application shutting down")
+
+# ----- FastAPI App -----
+app = FastAPI(
+    title="RAG Question Answering API",
+    version="2.1.0",
+    lifespan=lifespan
+)
 
 @app.post("/hackrx/run", response_model=AnswerResponse)
 async def ask_questions(
@@ -357,26 +302,23 @@ async def ask_questions(
     try:
         logger.info(f"Received request with {len(request.questions)} questions")
 
-        # Basic validation
+        # Validation
         if not request.documents.startswith(('http://', 'https://')):
             raise HTTPException(status_code=400, detail="Invalid document URL")
         if not request.questions:
             raise HTTPException(status_code=400, detail="Questions list is empty")
+        if len(request.questions) > 10:  # Limit for Railway
+            raise HTTPException(status_code=400, detail="Too many questions (max 10)")
 
-        # Process questions using optimized RAG engine
-        answers = rag_engine.process_document_questions(request.documents, request.questions)
+        # Process questions
+        answers = rag_engine.process_questions(request.documents, request.questions)
 
-        # Periodic cleanup
-        if len(rag_engine.document_cache) >= rag_engine.max_cache_size:
-            rag_engine.cleanup_old_collections(keep_recent=2)
-
-        logger.info(f"Successfully processed {len(answers)} answers")
         return {"answers": answers}
 
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Internal processing error: {str(e)}")
+        logger.error(f"Processing error: {str(e)}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.get("/health")
@@ -384,18 +326,17 @@ async def health_check():
     """Health check endpoint"""
     return {
         "status": "healthy",
-        "rag_initialized": rag_engine.initialized,
-        "cached_documents": len(rag_engine.document_cache),
+        "initialized": rag_engine.initialized,
+        "cached_docs": len(rag_engine.document_cache),
         "timestamp": datetime.now().isoformat()
     }
 
-@app.post("/clear-cache")
-async def clear_cache(authorization: str = Depends(verify_token)):
-    """Clear document cache and old collections"""
-    try:
-        rag_engine.document_cache.clear()
-        rag_engine.cleanup_old_collections(keep_recent=0)
-        return {"status": "Cache cleared successfully"}
-    except Exception as e:
-        logger.error(f"Cache clear error: {str(e)}")
-        raise HTTPException(status_code=500, detail="Failed to clear cache")
+@app.get("/")
+async def root():
+    """Root endpoint"""
+    return {"message": "RAG API is running", "version": "2.1.0"}
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
