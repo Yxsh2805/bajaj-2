@@ -4,14 +4,15 @@ import logging
 import hashlib
 from datetime import datetime
 from typing import List, Optional, Dict, Any
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import requests
+from bs4 import BeautifulSoup
 
 from fastapi import FastAPI, HTTPException, Header, Depends
 from pydantic import BaseModel
 
 # RAG imports
 from langchain_together import ChatTogether, TogetherEmbeddings
-from langchain_community.document_loaders import UnstructuredURLLoader
+from langchain.schema import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
@@ -34,6 +35,37 @@ class QuestionRequest(BaseModel):
 class AnswerResponse(BaseModel):
     answers: List[str]
 
+# ----- Lightweight Document Loader -----
+def load_url_content(url: str) -> List[Document]:
+    """Lightweight URL content loader to replace heavy unstructured package"""
+    try:
+        response = requests.get(url, timeout=30, headers={'User-Agent': 'Mozilla/5.0'})
+        response.raise_for_status()
+        
+        # Parse HTML content
+        soup = BeautifulSoup(response.content, 'html.parser')
+        
+        # Remove script and style elements
+        for script in soup(["script", "style", "nav", "footer", "header"]):
+            script.decompose()
+        
+        # Extract text content
+        text = soup.get_text()
+        
+        # Clean up text
+        lines = (line.strip() for line in text.splitlines())
+        chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
+        text = ' '.join(chunk for chunk in chunks if chunk)
+        
+        # Remove extra whitespace
+        text = ' '.join(text.split())
+        
+        return [Document(page_content=text, metadata={"source": url})]
+        
+    except Exception as e:
+        logger.error(f"Failed to load URL {url}: {e}")
+        raise
+
 # ----- Railway-Optimized RAG Engine -----
 class RailwayRAGEngine:
     def __init__(self):
@@ -44,10 +76,9 @@ class RailwayRAGEngine:
         self.policy_prompt = None
         self.initialized = False
         
-        # Reduced caching for Railway's memory constraints
+        # Minimal caching for Railway
         self.document_cache: Dict[str, Any] = {}
-        self.vectorstore_cache: Dict[str, Any] = {}
-        self.max_cache_size = 2  # Reduced for Railway
+        self.max_cache_size = 2
     
     def _get_url_hash(self, url: str) -> str:
         """Generate hash for URL for caching purposes"""
@@ -60,7 +91,7 @@ class RailwayRAGEngine:
             
         logger.info("Initializing Railway RAG engine...")
         
-        # Set environment variables with Railway-friendly defaults
+        # Set environment variables
         os.environ["TOGETHER_API_KEY"] = os.getenv("TOGETHER_API_KEY", "deb14836869b48e01e1853f49381b9eb7885e231ead3bc4f6bbb4a5fc4570b78")
         os.environ["LANGCHAIN_TRACING_V2"] = "true"
         os.environ["LANGCHAIN_API_KEY"] = os.getenv("LANGCHAIN_API_KEY", "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")
@@ -70,29 +101,21 @@ class RailwayRAGEngine:
         self.chat_model = ChatTogether(
             model="meta-llama/Llama-3.3-70B-Instruct-Turbo-Free",
             temperature=0,
-            max_tokens=3000  # Reduced for Railway
+            max_tokens=3000
         )
         self.embeddings = TogetherEmbeddings(model="BAAI/bge-base-en-v1.5")
 
-        # Railway-friendly persistent client with fallback
+        # Railway-friendly client with in-memory fallback
         try:
-            vector_path = os.environ.get("VECTOR_STORE_PATH", "./vectorstore")
-            os.makedirs(vector_path, exist_ok=True)
-            self.persistent_client = chromadb.PersistentClient(
-                path=vector_path,
-                settings=chromadb.Settings(
-                    anonymized_telemetry=False,
-                    allow_reset=True
-                )
-            )
-            logger.info(f"Using persistent storage at: {vector_path}")
+            self.persistent_client = chromadb.Client()  # In-memory for Railway
+            logger.info("Using in-memory ChromaDB client for Railway")
         except Exception as e:
-            logger.warning(f"Failed to create persistent client, using in-memory: {e}")
-            self.persistent_client = chromadb.Client()  # In-memory fallback
+            logger.error(f"Failed to initialize ChromaDB: {e}")
+            raise
 
-        # Optimized text splitter for Railway
+        # Optimized text splitter
         self.text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=600,  # Smaller chunks for Railway
+            chunk_size=600,
             chunk_overlap=80,
             separators=["\n\n", "\n", ". ", " ", ""]
         )
@@ -120,9 +143,9 @@ Context: {context}"""),
         """Build Railway-optimized RAG chain"""
         def retrieve(state):
             query = state["query"]
-            results = retriever.invoke(query, k=6)  # Reduced for Railway
+            results = retriever.invoke(query, k=5)
             context = " ".join([doc.page_content for doc in results])
-            return context[:3000]  # Limit context length for Railway
+            return context[:3000]
         
         return (
             RunnableAssign({"context": RunnableLambda(retrieve)}) |
@@ -132,9 +155,7 @@ Context: {context}"""),
         )
 
     def _load_and_process_document(self, url: str) -> tuple:
-        """Load and process document with Railway-friendly caching"""
-        url_hash = self._get_url_hash(url)
-        
+        """Load and process document with lightweight loader"""
         if url in self.document_cache:
             logger.info(f"Using cached document for {url}")
             return self.document_cache[url]
@@ -143,18 +164,17 @@ Context: {context}"""),
         start_time = time.time()
         
         try:
-            loader = UnstructuredURLLoader(urls=[url])
-            docs = loader.load()
+            # Use lightweight loader
+            docs = load_url_content(url)
             chunks = self.text_splitter.split_documents(docs)
             
             load_time = time.time() - start_time
             logger.info(f"Document loaded and chunked in {load_time:.2f}s ({len(chunks)} chunks)")
             
-            # Railway-friendly cache management
+            # Cache management
             if len(self.document_cache) >= self.max_cache_size:
                 oldest_key = next(iter(self.document_cache))
                 del self.document_cache[oldest_key]
-                logger.info(f"Removed oldest cached document: {oldest_key}")
             
             self.document_cache[url] = (docs, chunks)
             return docs, chunks
@@ -163,53 +183,38 @@ Context: {context}"""),
             logger.error(f"Failed to load document {url}: {e}")
             raise HTTPException(status_code=400, detail=f"Failed to load document: {str(e)}")
 
-    def _create_or_get_vectorstore(self, url: str, chunks: List) -> tuple:
-        """Create vectorstore with Railway optimization"""
+    def _create_vectorstore(self, url: str, chunks: List) -> Any:
+        """Create in-memory vectorstore"""
         url_hash = self._get_url_hash(url)
         collection_name = f"doc_{url_hash}"
         
-        try:
-            existing_collection = self.persistent_client.get_collection(collection_name)
-            if existing_collection.count() > 0:
-                logger.info(f"Reusing existing vectorstore: {collection_name}")
-                vectorstore = Chroma(
-                    client=self.persistent_client,
-                    collection_name=collection_name,
-                    embedding_function=self.embeddings,
-                )
-                return vectorstore, False
-        except Exception:
-            pass
-        
-        logger.info(f"Creating new vectorstore: {collection_name}")
+        logger.info(f"Creating vectorstore: {collection_name}")
         start_time = time.time()
         
-        vectorstore = Chroma(
-            client=self.persistent_client,
-            collection_name=collection_name,
-            embedding_function=self.embeddings,
-        )
-        
-        # Railway-optimized batch processing
-        batch_size = 25  # Smaller batches for Railway
-        total_chunks = len(chunks)
-        
         try:
-            for i in range(0, total_chunks, batch_size):
+            vectorstore = Chroma(
+                client=self.persistent_client,
+                collection_name=collection_name,
+                embedding_function=self.embeddings,
+            )
+            
+            # Add documents in batches
+            batch_size = 20
+            for i in range(0, len(chunks), batch_size):
                 batch = chunks[i:i + batch_size]
                 vectorstore.add_documents(batch)
-                logger.info(f"Processed batch {i//batch_size + 1}/{(total_chunks-1)//batch_size + 1}")
+            
+            creation_time = time.time() - start_time
+            logger.info(f"Vectorstore created in {creation_time:.2f}s")
+            
+            return vectorstore
+            
         except Exception as e:
             logger.error(f"Vectorstore creation error: {e}")
             raise HTTPException(status_code=500, detail="Failed to create vectorstore")
-        
-        creation_time = time.time() - start_time
-        logger.info(f"Vectorstore created in {creation_time:.2f}s")
-        
-        return vectorstore, True
 
     def process_document_questions(self, url: str, questions: List[str]) -> List[str]:
-        """Railway-optimized document processing and question answering"""
+        """Process document and answer questions"""
         if not self.initialized:
             raise RuntimeError("RAG engine not initialized")
         
@@ -219,13 +224,13 @@ Context: {context}"""),
             # Load and process document
             docs, chunks = self._load_and_process_document(url)
             
-            # Create or reuse vectorstore
-            vectorstore, is_new = self._create_or_get_vectorstore(url, chunks)
+            # Create vectorstore
+            vectorstore = self._create_vectorstore(url, chunks)
             
             # Create retriever
             retriever = vectorstore.as_retriever(
                 search_type="similarity",
-                search_kwargs={"k": 5}  # Optimized for Railway
+                search_kwargs={"k": 5}
             )
             
             # Build chain
@@ -259,23 +264,6 @@ Context: {context}"""),
         except Exception as e:
             logger.error(f"Error processing document: {str(e)}")
             raise
-
-    def cleanup_old_collections(self, keep_recent: int = 1):
-        """Clean up old collections for Railway memory management"""
-        try:
-            collections = self.persistent_client.list_collections()
-            if len(collections) > keep_recent:
-                sorted_collections = sorted(collections, key=lambda x: x.name, reverse=True)
-                to_delete = sorted_collections[keep_recent:]
-                
-                for collection in to_delete:
-                    try:
-                        self.persistent_client.delete_collection(collection.name)
-                        logger.info(f"Cleaned up old collection: {collection.name}")
-                    except Exception as e:
-                        logger.warning(f"Failed to delete collection {collection.name}: {e}")
-        except Exception as e:
-            logger.warning(f"Cleanup failed: {e}")
 
 # Global RAG engine instance
 rag_engine = RailwayRAGEngine()
@@ -320,10 +308,6 @@ async def ask_questions(
         # Process questions
         answers = rag_engine.process_document_questions(request.documents, request.questions)
 
-        # Periodic cleanup for Railway memory management
-        if len(rag_engine.document_cache) >= rag_engine.max_cache_size:
-            rag_engine.cleanup_old_collections(keep_recent=1)
-
         logger.info(f"Successfully processed {len(answers)} answers")
         return {"answers": answers}
 
@@ -343,19 +327,8 @@ async def health_check():
         "timestamp": datetime.now().isoformat()
     }
 
-@app.post("/clear-cache")
-async def clear_cache(authorization: str = Depends(verify_token)):
-    """Clear document cache and old collections"""
-    try:
-        rag_engine.document_cache.clear()
-        rag_engine.cleanup_old_collections(keep_recent=0)
-        return {"status": "Cache cleared successfully"}
-    except Exception as e:
-        logger.error(f"Cache clear error: {str(e)}")
-        raise HTTPException(status_code=500, detail="Failed to clear cache")
-
-# Railway-specific startup
+# Railway startup
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.environ.get("PORT", 8000))  # Railway sets this automatically
+    port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
