@@ -12,7 +12,11 @@ from pydantic import BaseModel
 
 # RAG imports
 from langchain_together import ChatTogether, TogetherEmbeddings
-from langchain.schema import Document
+# Change this import:
+# from langchain.schema import Document
+
+# To this:
+from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
@@ -37,30 +41,28 @@ class AnswerResponse(BaseModel):
 
 # ----- Lightweight Document Loader -----
 def load_url_content(url: str) -> List[Document]:
-    """Lightweight URL content loader to replace heavy unstructured package"""
+    """Lightweight URL content loader"""
     try:
         response = requests.get(url, timeout=30, headers={'User-Agent': 'Mozilla/5.0'})
         response.raise_for_status()
         
-        # Parse HTML content
         soup = BeautifulSoup(response.content, 'html.parser')
         
-        # Remove script and style elements
         for script in soup(["script", "style", "nav", "footer", "header"]):
             script.decompose()
         
-        # Extract text content
         text = soup.get_text()
-        
-        # Clean up text
         lines = (line.strip() for line in text.splitlines())
         chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
         text = ' '.join(chunk for chunk in chunks if chunk)
-        
-        # Remove extra whitespace
         text = ' '.join(text.split())
         
         return [Document(page_content=text, metadata={"source": url})]
+        
+    except Exception as e:
+        logger.error(f"Failed to load URL {url}: {e}")
+        raise
+
         
     except Exception as e:
         logger.error(f"Failed to load URL {url}: {e}")
@@ -332,3 +334,4 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
+
