@@ -6,23 +6,8 @@ pydantic==1.10.13
 # HTTP requests
 requests==2.31.0
 
-# LangChain and RAG components - compatible versions
-langchain==0.1.0
-langchain-together==0.1.3
-langchain-community==0.0.13
-langchain-text-splitters==0.0.1
-langchain-core==0.1.23
-langchain-chroma==0.1.0
-
-# Vector database - compatible version
-chromadb==0.4.22
-
 # PDF processing
 PyPDF2==3.0.1
-
-# Document processing
-unstructured==0.11.6
-python-multipart==0.0.6
 
 # Additional utilities
 python-dotenv==1.0.0
