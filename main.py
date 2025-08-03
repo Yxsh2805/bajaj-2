@@ -3,6 +3,7 @@ import time
 import logging
 import hashlib
 import requests
+import json
 from datetime import datetime
 from typing import List, Optional, Dict, Any
 from contextlib import asynccontextmanager
@@ -11,29 +12,12 @@ from io import BytesIO
 from fastapi import FastAPI, HTTPException, Header, Depends
 from pydantic import BaseModel
 
-# RAG imports
-from langchain_together import ChatTogether, TogetherEmbeddings
-from langchain_community.document_loaders import PyPDFLoader, UnstructuredURLLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import StrOutputParser
-from langchain_core.runnables import RunnableAssign, RunnableLambda
-from langchain_core.documents import Document
-import chromadb
-from langchain_chroma import Chroma
-
-# PDF processing
+# Try importing PDF libraries
 try:
     import PyPDF2
     PDF_SUPPORT = True
 except ImportError:
     PDF_SUPPORT = False
-    
-try:
-    from pdfplumber import PDF
-    PDFPLUMBER_SUPPORT = True
-except ImportError:
-    PDFPLUMBER_SUPPORT = False
 
 # Set up logging
 logging.basicConfig(
@@ -53,18 +37,12 @@ class QuestionRequest(BaseModel):
 class AnswerResponse(BaseModel):
     answers: List[str]
 
-# ----- Enhanced RAG Engine with PDF Support -----
-class EnhancedRAGEngine:
+# ----- Simple RAG Engine using Together API directly -----
+class SimpleRAGEngine:
     def __init__(self):
-        self.chat_model = None
-        self.embeddings = None
-        self.persistent_client = None
-        self.text_splitter = None
-        self.policy_prompt = None
+        self.together_api_key = None
         self.initialized = False
-        
-        # Simplified caching
-        self.document_cache: Dict[str, Any] = {}
+        self.document_cache: Dict[str, str] = {}
         self.max_cache_size = 3
     
     def _get_url_hash(self, url: str) -> str:
@@ -72,198 +50,127 @@ class EnhancedRAGEngine:
         return hashlib.md5(url.encode()).hexdigest()[:8]
     
     def initialize(self):
-        """Initialize RAG components"""
+        """Initialize the engine"""
         if self.initialized:
             return
             
-        logger.info("Initializing Enhanced RAG engine...")
+        logger.info("Initializing Simple RAG engine...")
         
-        # Get environment variables
-        together_api_key = os.getenv("TOGETHER_API_KEY")
-        langchain_api_key = os.getenv("LANGCHAIN_API_KEY")
-        
-        if not together_api_key:
+        # Get API key
+        self.together_api_key = os.getenv("TOGETHER_API_KEY")
+        if not self.together_api_key:
             raise ValueError("TOGETHER_API_KEY environment variable is required")
-        if not langchain_api_key:
-            raise ValueError("LANGCHAIN_API_KEY environment variable is required")
-
-        # Set environment variables
-        os.environ["LANGCHAIN_TRACING_V2"] = os.getenv("LANGCHAIN_TRACING_V2", "false")
-        os.environ["LANGCHAIN_PROJECT"] = os.getenv("LANGCHAIN_PROJECT", "rag-railway")
-
-        try:
-            # Initialize LLM and embeddings
-            self.chat_model = ChatTogether(
-                model="meta-llama/Llama-3.3-70B-Instruct-Turbo-Free",
-                temperature=0,
-                max_tokens=3000
-            )
-            self.embeddings = TogetherEmbeddings(model="BAAI/bge-base-en-v1.5")
-            logger.info("LLM and embeddings initialized")
-
-        except Exception as e:
-            logger.error(f"Failed to initialize LLM/embeddings: {str(e)}")
-            raise
-
-        try:
-            # Use in-memory ChromaDB for Railway
-            self.persistent_client = chromadb.Client()
-            logger.info("ChromaDB client initialized (in-memory)")
-
-        except Exception as e:
-            logger.error(f"Failed to initialize ChromaDB: {str(e)}")
-            raise
-
-        # Text splitter
-        self.text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=600,
-            chunk_overlap=50,
-            separators=["\n\n", "\n", ". ", " "]
-        )
-
-        # Prompt template
-        self.policy_prompt = ChatPromptTemplate([
-            ("system", """You are an expert insurance policy assistant. Answer questions accurately and concisely based on the provided policy document.
-
-FORMAT: Input questions are separated by " | ". Output answers MUST be separated by " | " in the same order.
-
-Guidelines:
-- Give direct, clear answers based on the policy document
-- Cite specific policy terms when available
-- If information is not found in the document, state "Information not found in the policy document"
-- Maintain exact order and use " | " separator between answers
-- Be specific about waiting periods, coverage limits, and conditions"""),
-            ("human", """Questions: {query}
-Policy Document Context: {context}"""),
-        ])
 
         self.initialized = True
-        logger.info("Enhanced RAG engine initialized successfully")
+        logger.info("Simple RAG engine initialized successfully")
 
-    def _download_pdf_content(self, url: str) -> str:
-        """Download and extract text from PDF URL"""
+    def _extract_pdf_text(self, url: str) -> str:
+        """Extract text from PDF URL"""
         try:
             logger.info(f"Downloading PDF from: {url}")
-            response = requests.get(url, timeout=30)
+            response = requests.get(url, timeout=60)
             response.raise_for_status()
             
-            # Try PyPDF2 first
             if PDF_SUPPORT:
                 try:
                     pdf_file = BytesIO(response.content)
                     pdf_reader = PyPDF2.PdfReader(pdf_file)
                     text = ""
-                    for page in pdf_reader.pages:
-                        text += page.extract_text() + "\n"
+                    for page_num, page in enumerate(pdf_reader.pages):
+                        page_text = page.extract_text()
+                        text += f"\n--- Page {page_num + 1} ---\n{page_text}\n"
+                    
                     if text.strip():
-                        logger.info(f"Successfully extracted text using PyPDF2 ({len(text)} characters)")
+                        logger.info(f"Successfully extracted PDF text ({len(text)} characters)")
                         return text
                 except Exception as e:
-                    logger.warning(f"PyPDF2 extraction failed: {e}")
+                    logger.error(f"PyPDF2 extraction failed: {e}")
             
-            # Fallback: Try to use requests to get content and treat as text
-            logger.info("Attempting fallback text extraction...")
+            # Fallback: treat as text
             content = response.content.decode('utf-8', errors='ignore')
-            if len(content) > 100:  # Basic check for valid content
+            if len(content) > 100:
                 return content
                 
-            raise Exception("No suitable PDF extraction method available")
+            raise Exception("Could not extract readable content from PDF")
             
         except Exception as e:
-            logger.error(f"Failed to download/extract PDF: {e}")
+            logger.error(f"Failed to extract PDF text: {e}")
             raise
 
-    def build_chain(self, retriever):
-        """Build RAG chain"""
-        def retrieve(state):
-            query = state["query"]
-            results = retriever.invoke(query)
-            context = " ".join([doc.page_content for doc in results])
-            return context[:3000]  # Limit context length
-        
-        return (
-            RunnableAssign({"context": RunnableLambda(retrieve)}) |
-            self.policy_prompt |
-            self.chat_model |
-            StrOutputParser()
-        )
-
-    def _load_document(self, url: str):
-        """Load and process document (PDF or web page)"""
-        url_hash = self._get_url_hash(url)
-        
-        # Check cache
+    def _get_document_text(self, url: str) -> str:
+        """Get document text with caching"""
+        # Check cache first
         if url in self.document_cache:
-            logger.info(f"Using cached document for {url}")
+            logger.info("Using cached document")
             return self.document_cache[url]
         
-        logger.info(f"Loading document: {url}")
+        # Extract text based on URL type
+        if url.lower().endswith('.pdf') or 'pdf' in url.lower():
+            text = self._extract_pdf_text(url)
+        else:
+            # Handle regular web pages
+            response = requests.get(url, timeout=30)
+            response.raise_for_status()
+            text = response.text
         
-        try:
-            # Check if it's a PDF URL
-            if url.lower().endswith('.pdf') or 'pdf' in url.lower():
-                # Handle PDF
-                text_content = self._download_pdf_content(url)
-                # Create document object
-                doc = Document(page_content=text_content, metadata={"source": url})
-                chunks = self.text_splitter.split_documents([doc])
-            else:
-                # Handle web pages - try unstructured first, fallback to requests
-                try:
-                    loader = UnstructuredURLLoader(urls=[url])
-                    docs = loader.load()
-                    chunks = self.text_splitter.split_documents(docs)
-                except Exception as e:
-                    logger.warning(f"UnstructuredURLLoader failed: {e}, trying requests fallback")
-                    # Fallback to simple requests
-                    response = requests.get(url, timeout=30)
-                    response.raise_for_status()
-                    doc = Document(page_content=response.text, metadata={"source": url})
-                    chunks = self.text_splitter.split_documents([doc])
-            
-            logger.info(f"Document loaded ({len(chunks)} chunks)")
-            
-            # Simple cache management
-            if len(self.document_cache) >= self.max_cache_size:
-                oldest_key = next(iter(self.document_cache))
-                del self.document_cache[oldest_key]
-            
-            self.document_cache[url] = chunks
-            return chunks
-            
-        except Exception as e:
-            logger.error(f"Failed to load document from {url}: {str(e)}")
-            raise HTTPException(status_code=400, detail=f"Failed to load document: {str(e)}")
+        # Cache management
+        if len(self.document_cache) >= self.max_cache_size:
+            oldest_key = next(iter(self.document_cache))
+            del self.document_cache[oldest_key]
+        
+        self.document_cache[url] = text
+        return text
 
-    def _create_vectorstore(self, chunks: List, collection_name: str):
-        """Create vectorstore"""
-        logger.info(f"Creating vectorstore: {collection_name}")
+    def _chunk_text(self, text: str, chunk_size: int = 1000, overlap: int = 100) -> List[str]:
+        """Simple text chunking"""
+        chunks = []
+        start = 0
+        while start < len(text):
+            end = start + chunk_size
+            chunk = text[start:end]
+            chunks.append(chunk)
+            start = end - overlap
+        return chunks
+
+    def _find_relevant_chunks(self, chunks: List[str], questions: List[str], max_chunks: int = 5) -> List[str]:
+        """Simple keyword-based chunk selection"""
+        # Combine all questions to find keywords
+        all_questions = " ".join(questions).lower()
+        question_words = set(all_questions.split())
+        
+        # Score chunks based on keyword overlap
+        chunk_scores = []
+        for i, chunk in enumerate(chunks):
+            chunk_lower = chunk.lower()
+            score = sum(1 for word in question_words if word in chunk_lower and len(word) > 3)
+            chunk_scores.append((score, i, chunk))
+        
+        # Return top chunks
+        chunk_scores.sort(key=lambda x: x[0], reverse=True)
+        return [chunk for _, _, chunk in chunk_scores[:max_chunks]]
+
+    def _call_together_api(self, prompt: str) -> str:
+        """Call Together API directly"""
+        url = "https://api.together.xyz/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {self.together_api_key}",
+            "Content-Type": "application/json"
+        }
+        
+        data = {
+            "model": "meta-llama/Llama-3.2-11B-Vision-Instruct-Turbo",
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0,
+            "max_tokens": 3000
+        }
         
         try:
-            # Create collection
-            collection = self.persistent_client.create_collection(
-                name=collection_name,
-                get_or_create=True
-            )
-            
-            # Create vectorstore
-            vectorstore = Chroma(
-                client=self.persistent_client,
-                collection_name=collection_name,
-                embedding_function=self.embeddings,
-            )
-            
-            # Add documents in batches
-            batch_size = 10  # Reduced for Railway memory limits
-            for i in range(0, len(chunks), batch_size):
-                batch = chunks[i:i + batch_size]
-                vectorstore.add_documents(batch)
-            
-            logger.info("Vectorstore created successfully")
-            return vectorstore
-            
+            response = requests.post(url, headers=headers, json=data, timeout=60)
+            response.raise_for_status()
+            result = response.json()
+            return result["choices"][0]["message"]["content"]
         except Exception as e:
-            logger.error(f"Failed to create vectorstore: {str(e)}")
+            logger.error(f"Together API call failed: {e}")
             raise
 
     def process_questions(self, url: str, questions: List[str]) -> List[str]:
@@ -272,62 +179,65 @@ Policy Document Context: {context}"""),
             raise RuntimeError("RAG engine not initialized")
         
         try:
-            # Load document
-            chunks = self._load_document(url)
+            # Get document text
+            document_text = self._get_document_text(url)
             
-            if not chunks:
-                raise HTTPException(status_code=400, detail="No content extracted from document")
+            # Chunk the document
+            chunks = self._chunk_text(document_text)
+            logger.info(f"Document split into {len(chunks)} chunks")
             
-            # Create unique collection name
-            url_hash = self._get_url_hash(url)
-            collection_name = f"doc_{url_hash}_{int(time.time())}"
+            # Find relevant chunks
+            relevant_chunks = self._find_relevant_chunks(chunks, questions)
+            context = "\n\n".join(relevant_chunks)
             
-            # Create vectorstore
-            vectorstore = self._create_vectorstore(chunks, collection_name)
+            # Prepare prompt
+            questions_text = " | ".join(questions)
             
-            # Create retriever
-            retriever = vectorstore.as_retriever(
-                search_type="similarity",
-                search_kwargs={"k": 5}
-            )
+            prompt = f"""You are an expert insurance policy assistant. Answer the following questions based ONLY on the provided policy document context.
+
+CRITICAL FORMAT: The questions are separated by " | ". Your answers MUST also be separated by " | " in the exact same order.
+
+Questions: {questions_text}
+
+Policy Document Context:
+{context[:4000]}
+
+Instructions:
+- Answer each question based solely on the policy document provided
+- Give direct, clear answers
+- If information is not found in the document, say "Information not available in the policy document"
+- Maintain the exact order of questions
+- Separate each answer with " | "
+- Be specific about waiting periods, coverage amounts, and conditions when mentioned
+
+Answers:"""
+
+            # Get response from Together API
+            response = self._call_together_api(prompt)
             
-            # Build chain
-            rag_chain = self.build_chain(retriever)
+            # Parse answers
+            if " | " in response:
+                answers = [answer.strip() for answer in response.split(" | ")]
+            else:
+                # Fallback: split by newlines or return single answer
+                answers = [line.strip() for line in response.split('\n') if line.strip()]
+                if not answers:
+                    answers = [response.strip()]
             
-            # Process questions
-            logger.info(f"Processing {len(questions)} questions")
-            batch_query = " | ".join(questions)
-            
-            batch_result = rag_chain.invoke({"query": batch_query})
-            
-            # Parse results
-            answers = [answer.strip() for answer in batch_result.split(" | ")]
-            
-            # Ensure answer count matches question count
-            if len(answers) != len(questions):
-                logger.warning("Answer count mismatch, adjusting...")
-                while len(answers) < len(questions):
-                    answers.append("Unable to generate answer.")
-                answers = answers[:len(questions)]
+            # Ensure we have the right number of answers
+            while len(answers) < len(questions):
+                answers.append("Unable to determine from the policy document.")
+            answers = answers[:len(questions)]
             
             logger.info(f"Successfully processed {len(answers)} answers")
-            
-            # Cleanup
-            try:
-                self.persistent_client.delete_collection(collection_name)
-            except:
-                pass  # Ignore cleanup errors
-            
             return answers
-
-        except HTTPException:
-            raise
+            
         except Exception as e:
             logger.error(f"Error processing questions: {str(e)}")
-            raise HTTPException(status_code=500, detail=f"Processing error: {str(e)}")
+            raise
 
 # Global RAG engine instance
-rag_engine = EnhancedRAGEngine()
+rag_engine = SimpleRAGEngine()
 
 # ----- Token Verifier -----
 def verify_token(authorization: Optional[str] = Header(None)):
@@ -356,8 +266,8 @@ async def lifespan(app: FastAPI):
 
 # ----- FastAPI App -----
 app = FastAPI(
-    title="Enhanced RAG Question Answering API",
-    version="2.2.0",
+    title="Simple RAG Question Answering API",
+    version="3.0.0",
     lifespan=lifespan
 )
 
@@ -386,7 +296,7 @@ async def ask_questions(
         raise
     except Exception as e:
         logger.error(f"Processing error: {str(e)}")
-        raise HTTPException(status_code=500, detail="Internal server error")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 @app.get("/health")
 async def health_check():
@@ -402,7 +312,7 @@ async def health_check():
 @app.get("/")
 async def root():
     """Root endpoint"""
-    return {"message": "Enhanced RAG API is running", "version": "2.2.0", "pdf_support": PDF_SUPPORT}
+    return {"message": "Simple RAG API is running", "version": "3.0.0", "pdf_support": PDF_SUPPORT}
 
 if __name__ == "__main__":
     import uvicorn
