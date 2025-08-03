@@ -1,9 +1,29 @@
-fastapi
-uvicorn
-pydantic
-langchain-together
-langchain-community
-langchain-core
-chromadb
-langchain-chroma
-python-magic
+
+# Core FastAPI and server
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+pydantic==2.5.0
+
+# HTTP requests
+requests==2.31.0
+
+# LangChain and RAG components
+langchain-together==0.1.1
+langchain-community==0.0.38
+langchain-text-splitters==0.0.1
+langchain-core==0.1.52
+langchain-chroma==0.1.2
+
+# Vector database
+chromadb==0.4.15
+
+# PDF processing
+PyPDF2==3.0.1
+pdfplumber==0.10.3
+
+# Document processing (optional fallback)
+unstructured[html]==0.11.6
+python-multipart==0.0.6
+
+# Additional utilities
+python-dotenv==1.0.0
