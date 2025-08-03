@@ -6,6 +6,7 @@ import requests
 import json
 from datetime import datetime
 from typing import List, Optional, Dict, Any
+from contextlib import asynccontextmanager
 from io import BytesIO
 
 from fastapi import FastAPI, HTTPException, Header, Depends
@@ -247,21 +248,28 @@ def verify_token(authorization: Optional[str] = Header(None)):
     if token != EXPECTED_TOKEN:
         raise HTTPException(status_code=403, detail="Invalid token")
 
-# ----- FastAPI App -----
-app = FastAPI(
-    title="Simple RAG Question Answering API",
-    version="3.0.0"
-)
-
-# ----- Startup Event -----
-@app.on_event("startup")
-async def startup_event():
+# ----- Lifespan Event Handler -----
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
     try:
         rag_engine.initialize()
         logger.info("Application startup completed")
     except Exception as e:
         logger.error(f"Failed to initialize: {str(e)}")
         raise
+    
+    yield
+    
+    # Shutdown
+    logger.info("Application shutting down")
+
+# ----- FastAPI App -----
+app = FastAPI(
+    title="Simple RAG Question Answering API",
+    version="3.0.0",
+    lifespan=lifespan
+)
 
 @app.post("/hackrx/run", response_model=AnswerResponse)
 async def ask_questions(
