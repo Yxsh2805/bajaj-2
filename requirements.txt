@@ -1,11 +1,9 @@
 fastapi
-uvicorn[standard]
-pydantic>=2.7.4
+uvicorn
+pydantic
 langchain-together
 langchain-community
-langchain-text-splitters
 langchain-core
 chromadb
 langchain-chroma
-unstructured[all-docs]
 python-magic
