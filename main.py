@@ -20,7 +20,8 @@ from pydantic import BaseModel
 
 # RAG imports
 from langchain_together import ChatTogether
-from langchain_openai import OpenAIEmbeddings
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
+import google.generativeai as genai
 
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -46,7 +47,7 @@ class BalancedVectorStore:
     
     def add_documents_balanced(self, documents: List[Document]):
         """Balanced approach - good speed + accuracy"""
-        logger.info(f"BALANCED: Processing {len(documents)} chunks")
+        logger.info(f"BALANCED: Processing {len(documents)} chunks with Google Gemini")
         
         start_time = time.time()
         
@@ -57,14 +58,14 @@ class BalancedVectorStore:
             except Exception as e:
                 # One retry only
                 try:
-                    time.sleep(0.2)  # Brief pause
+                    time.sleep(0.3)  # Slightly longer pause for Google API
                     return self.embeddings.embed_query(doc.page_content)
                 except:
                     logger.warning(f"Failed to embed chunk: {str(e)[:50]}")
                     return None
         
-        # 12 workers - aggressive but stable
-        with ThreadPoolExecutor(max_workers=12) as executor:
+        # 10 workers - conservative for Google API rate limits
+        with ThreadPoolExecutor(max_workers=10) as executor:
             vectors = list(executor.map(embed_with_simple_retry, documents))
         
         # Store successful results
@@ -77,7 +78,7 @@ class BalancedVectorStore:
         
         embedding_time = time.time() - start_time
         success_rate = (successful_count / len(documents)) * 100
-        logger.info(f"BALANCED: {embedding_time:.1f}s, {successful_count}/{len(documents)} chunks ({success_rate:.1f}% success)")
+        logger.info(f"GOOGLE GEMINI: {embedding_time:.1f}s, {successful_count}/{len(documents)} chunks ({success_rate:.1f}% success)")
     
     def similarity_search(self, query: str, k: int = 7) -> List[Document]:
         """Balanced similarity search for good retrieval"""
@@ -175,31 +176,40 @@ class BalancedRAGEngine:
         if self.initialized:
             return
             
-        logger.info("Initializing BALANCED RAG engine...")
+        logger.info("Initializing BALANCED RAG engine with Google Gemini...")
         
-        os.environ["TOGETHER_API_KEY"] = os.getenv("TOGETHER_API_KEY", "deb14836869b48e01e1853f49381b9eb7885e231ead3bc4f6bbb4a5fc4570b78")
-        
-        # Updated with your specified OpenAI API key
-        self.embeddings = OpenAIEmbeddings(
-            model="text-embedding-3-small",
-            openai_api_key="sk-1234567890abcdef1234567890abcdef12345678"
-        )
-        
-        self.chat_model = ChatTogether(
-            model="meta-llama/Llama-3.3-70B-Instruct-Turbo-Free",
-            temperature=0,
-            max_tokens=3500
-        )
+        try:
+            # Configure Google Generative AI
+            genai.configure(api_key="AIzaSyA2FLkqwfhTBdNs5GQTFntG7jclk_hDmeQ")
+            
+            # Together AI for chat model
+            os.environ["TOGETHER_API_KEY"] = os.getenv("TOGETHER_API_KEY", "deb14836869b48e01e1853f49381b9eb7885e231ead3bc4f6bbb4a5fc4570b78")
+            
+            # Google Gemini for embeddings (FREE!)
+            self.embeddings = GoogleGenerativeAIEmbeddings(
+                model="models/embedding-001",
+                google_api_key="AIzaSyA2FLkqwfhTBdNs5GQTFntG7jclk_hDmeQ"
+            )
+            
+            self.chat_model = ChatTogether(
+                model="meta-llama/Llama-3.3-70B-Instruct-Turbo-Free",
+                temperature=0,
+                max_tokens=3500
+            )
 
-        # Balanced chunking for good accuracy
-        self.text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1100,  # Good balance
-            chunk_overlap=110,  # 10% overlap
-            separators=["\n\n", "\n", ". ", "! ", "? ", " "]
-        )
+            # Balanced chunking for good accuracy
+            self.text_splitter = RecursiveCharacterTextSplitter(
+                chunk_size=1100,  # Good balance
+                chunk_overlap=110,  # 10% overlap
+                separators=["\n\n", "\n", ". ", "! ", "? ", " "]
+            )
 
-        self.initialized = True
-        logger.info("BALANCED RAG engine ready")
+            self.initialized = True
+            logger.info("BALANCED RAG engine with Google Gemini ready!")
+            
+        except Exception as e:
+            logger.error(f"Initialization error: {e}")
+            raise
 
     def _balanced_query(self, vectorstore: BalancedVectorStore, query: str) -> str:
         """Balanced LLM query with good context"""
@@ -251,7 +261,7 @@ Provide detailed, accurate answers separated by " | " in the same order."""
         try:
             return await asyncio.wait_for(
                 self._process_internal(url, questions),
-                timeout=50.0
+                timeout=60.0  # Increased timeout for Google API
             )
         except asyncio.TimeoutError:
             raise HTTPException(status_code=408, detail="Processing timeout")
@@ -321,21 +331,21 @@ def verify_token(authorization: Optional[str] = Header(None)):
 async def lifespan(app: FastAPI):
     try:
         rag_engine.initialize()
-        logger.info("BALANCED RAG application ready")
+        logger.info("GOOGLE GEMINI RAG application ready")
     except Exception as e:
         logger.error(f"Startup error: {e}")
     yield
 
-app = FastAPI(title="BALANCED RAG API", version="3.0.0", lifespan=lifespan)
+app = FastAPI(title="GOOGLE GEMINI RAG API", version="3.0.0", lifespan=lifespan)
 
 @app.post("/hackrx/run", response_model=AnswerResponse)
 async def ask_questions(
     request: QuestionRequest,
     authorization: str = Depends(verify_token)
 ):
-    """Balanced processing - good speed + accuracy"""
+    """Balanced processing with Google Gemini - FREE and reliable"""
     try:
-        logger.info(f"BALANCED processing: {len(request.questions)} questions")
+        logger.info(f"GOOGLE GEMINI processing: {len(request.questions)} questions")
 
         if not request.documents.startswith(('http://', 'https://')):
             raise HTTPException(status_code=400, detail="Invalid document URL")
@@ -344,7 +354,7 @@ async def ask_questions(
 
         answers = await rag_engine.process_balanced(request.documents, request.questions)
 
-        logger.info(f"BALANCED: Completed {len(answers)} answers")
+        logger.info(f"GOOGLE GEMINI: Completed {len(answers)} answers")
         return {"answers": answers}
 
     except HTTPException:
@@ -358,12 +368,13 @@ async def health_check():
     return {
         "status": "healthy",
         "cache_entries": len(rag_engine.vectorstore_cache),
-        "mode": "balanced_speed_accuracy"
+        "mode": "google_gemini_embeddings",
+        "embedding_provider": "Google Gemini API (FREE)"
     }
 
 @app.get("/")
 async def root():
-    return {"message": "BALANCED RAG API - Speed + 65%+ Accuracy"}
+    return {"message": "GOOGLE GEMINI RAG API - FREE, Fast & Reliable"}
 
 if __name__ == "__main__":
     import uvicorn
