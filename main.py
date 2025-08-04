@@ -13,8 +13,8 @@ import email
 import io
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import signal
+from concurrent.futures import ThreadPoolExecutor
+import asyncio
 
 from fastapi import FastAPI, HTTPException, Header, Depends
 from pydantic import BaseModel
@@ -28,10 +28,8 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Expected Bearer token for authentication
 EXPECTED_TOKEN = "5aa05ad358e859e92978582cde20423149f28beb49da7a2bbb487afa8fce1be8"
 
-# ----- Request/Response Models -----
 class QuestionRequest(BaseModel):
     documents: str
     questions: List[str]
@@ -39,77 +37,94 @@ class QuestionRequest(BaseModel):
 class AnswerResponse(BaseModel):
     answers: List[str]
 
-# ----- Optimized Vector Store -----
-class OptimizedVectorStore:
+class IntelligentVectorStore:
     def __init__(self, embeddings):
         self.embeddings = embeddings
         self.documents = []
         self.vectors = []
     
-    def add_documents(self, documents: List[Document]):
-        """Add documents to the vector store with batch processing"""
-        for doc in documents:
-            vector = self.embeddings.embed_query(doc.page_content)
-            self.documents.append(doc)
-            self.vectors.append(vector)
+    def add_documents_batch(self, documents: List[Document]):
+        """Add documents in optimized batches"""
+        batch_size = 20  # Aggressive batching for speed
+        
+        for i in range(0, len(documents), batch_size):
+            batch = documents[i:i + batch_size]
+            batch_vectors = []
+            
+            # Process batch of documents
+            for doc in batch:
+                vector = self.embeddings.embed_query(doc.page_content)
+                batch_vectors.append(vector)
+                self.documents.append(doc)
+            
+            self.vectors.extend(batch_vectors)
+            
+            if (i // batch_size + 1) % 3 == 0:  # Log every 3rd batch
+                logger.info(f"Processed embedding batch {i // batch_size + 1}")
     
-    def similarity_search(self, query: str, k: int = 4) -> List[Document]:
-        """High-quality similarity search with threshold filtering"""
+    def similarity_search(self, query: str, k: int = 6) -> List[Document]:
+        """High-quality similarity search"""
         if not self.vectors:
             return []
         
         query_vector = self.embeddings.embed_query(query)
         similarities = cosine_similarity([query_vector], self.vectors)[0]
         
-        # Use similarity threshold to ensure quality results
-        threshold = 0.1
-        top_indices = np.argsort(similarities)[-8:][::-1]  # Get top 8, filter by threshold
+        # Enhanced filtering for better results
+        threshold = 0.05  # Lower threshold for more coverage
+        top_indices = np.argsort(similarities)[-12:][::-1]  # Get top 12, filter to 6
         
         filtered_indices = [i for i in top_indices if similarities[i] > threshold][:k]
         return [self.documents[i] for i in filtered_indices if i < len(self.documents)]
 
-# ----- Optimized Document Loader -----
-def load_document_content_optimized(url: str) -> List[Document]:
-    """Load content with smart size management and speed optimization"""
+def smart_document_loader(url: str) -> List[Document]:
+    """Intelligent document loading with smart sampling"""
     try:
         response = requests.get(url, timeout=15, headers={'User-Agent': 'Mozilla/5.0'})
         response.raise_for_status()
         
-        # Smart size management - allow reasonable documents
-        if len(response.content) > 8 * 1024 * 1024:  # 8MB limit for speed
-            logger.warning("Large document detected - processing first 8MB for speed")
-            content = response.content[:8 * 1024 * 1024]
-        else:
-            content = response.content
-        
         url_lower = url.lower()
         content_type = response.headers.get('content-type', '').lower()
         
-        # Handle PDF files
+        # Handle PDF with intelligent processing
         if url_lower.endswith('.pdf') or 'pdf' in content_type:
-            pdf_file = io.BytesIO(content)
+            pdf_file = io.BytesIO(response.content)
             pdf_reader = PyPDF2.PdfReader(pdf_file)
+            total_pages = len(pdf_reader.pages)
+            
+            # Smart page selection strategy
+            if total_pages <= 25:
+                pages_to_process = list(range(total_pages))
+            else:
+                # Intelligent sampling: first 15, last 10, middle samples
+                first_pages = list(range(15))
+                last_pages = list(range(total_pages-10, total_pages))
+                middle_step = max(1, (total_pages-25)//10)
+                middle_pages = list(range(15, total_pages-10, middle_step))[:10]
+                pages_to_process = sorted(set(first_pages + middle_pages + last_pages))
+            
             text = ""
-            # Limit pages for speed while maintaining quality
-            max_pages = min(50, len(pdf_reader.pages))  # Process up to 50 pages
-            for i, page in enumerate(pdf_reader.pages[:max_pages]):
-                text += page.extract_text() + "\n"
-                if i > 0 and i % 10 == 0:  # Progress check every 10 pages
-                    logger.info(f"Processed {i+1}/{max_pages} pages")
-            return [Document(page_content=text.strip(), metadata={"source": url, "type": "pdf"})]
+            for i in pages_to_process:
+                if i < len(pdf_reader.pages):
+                    page_text = pdf_reader.pages[i].extract_text()
+                    text += page_text + "\n\n"  # Double newline for better chunking
+                    
+                    if (i + 1) % 10 == 0:
+                        logger.info(f"Processed {i+1} pages")
+            
+            logger.info(f"Smart sampling: processed {len(pages_to_process)}/{total_pages} pages")
+            return [Document(page_content=text.strip(), metadata={"source": url, "type": "pdf", "pages": len(pages_to_process)})]
         
-        # Handle DOCX files
+        # Handle other file types (DOCX, EML, HTML) - same as before
         elif url_lower.endswith('.docx') or 'wordprocessingml' in content_type:
-            docx_file = io.BytesIO(content)
+            docx_file = io.BytesIO(response.content)
             doc = DocxDocument(docx_file)
             text = "\n".join([paragraph.text for paragraph in doc.paragraphs])
             return [Document(page_content=text.strip(), metadata={"source": url, "type": "docx"})]
         
-        # Handle EML files
         elif url_lower.endswith('.eml') or 'message/rfc822' in content_type:
-            eml_content = content.decode('utf-8', errors='ignore')
+            eml_content = response.content.decode('utf-8', errors='ignore')
             msg = email.message_from_string(eml_content)
-            
             text = ""
             if msg.is_multipart():
                 for part in msg.walk():
@@ -117,116 +132,94 @@ def load_document_content_optimized(url: str) -> List[Document]:
                         text += part.get_payload(decode=True).decode('utf-8', errors='ignore')
             else:
                 text = msg.get_payload(decode=True).decode('utf-8', errors='ignore')
-            
             return [Document(page_content=text.strip(), metadata={"source": url, "type": "eml"})]
         
-        # Handle HTML/Text files (default)
-        else:
-            soup = BeautifulSoup(content, 'html.parser')
-            
+        else:  # HTML
+            soup = BeautifulSoup(response.content, 'html.parser')
             for script in soup(["script", "style", "nav", "footer", "header"]):
                 script.decompose()
-            
             text = soup.get_text()
             lines = (line.strip() for line in text.splitlines())
             chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
             text = ' '.join(chunk for chunk in chunks if chunk)
-            text = ' '.join(text.split())
-            
-            return [Document(page_content=text, metadata={"source": url, "type": "html"})]
+            return [Document(page_content=' '.join(text.split()), metadata={"source": url, "type": "html"})]
         
     except Exception as e:
         logger.error(f"Failed to load document {url}: {e}")
         raise
 
-# ----- High-Performance RAG Engine -----
-class HighPerformanceRAGEngine:
+class IntelligentRAGEngine:
     def __init__(self):
         self.chat_model = None
         self.embeddings = None
         self.text_splitter = None
         self.initialized = False
         self.document_cache: Dict[str, Any] = {}
-        self.max_cache_size = 3  # Slightly larger for better caching
+        self.max_cache_size = 3
     
     def _get_url_hash(self, url: str) -> str:
         return hashlib.md5(url.encode()).hexdigest()[:12]
     
     def initialize(self):
-        """Initialize optimized RAG components"""
+        """Initialize with optimal settings for 30-second processing"""
         if self.initialized:
             return
             
-        logger.info("Initializing high-performance RAG engine...")
+        logger.info("Initializing intelligent RAG engine...")
         
         try:
-            # Set environment variables
             os.environ["TOGETHER_API_KEY"] = os.getenv("TOGETHER_API_KEY", "deb14836869b48e01e1853f49381b9eb7885e231ead3bc4f6bbb4a5fc4570b78")
             
-            # Initialize embeddings
-            self.embeddings = TogetherEmbeddings(
-                model="BAAI/bge-base-en-v1.5"
-            )
-            
-            # Test embeddings quickly
-            logger.info("Testing embeddings...")
-            test_embedding = self.embeddings.embed_query("test")
-            logger.info(f"Embeddings working - dimension: {len(test_embedding)}")
-
-            # Initialize chat model
+            self.embeddings = TogetherEmbeddings(model="BAAI/bge-base-en-v1.5")
             self.chat_model = ChatTogether(
                 model="meta-llama/Llama-3.3-70B-Instruct-Turbo-Free",
                 temperature=0,
                 max_tokens=3000
             )
 
-            # Optimized text splitter for speed + quality
+            # Optimized chunking for speed and quality balance
             self.text_splitter = RecursiveCharacterTextSplitter(
-                chunk_size=500,  # Sweet spot for accuracy vs speed
-                chunk_overlap=75,  # Maintains context overlap
-                separators=["\n\n", "\n", ". ", "!", "?", " ", ""]  # Better semantic breaks
+                chunk_size=1200,  # Larger chunks = fewer embeddings
+                chunk_overlap=120, # Sufficient overlap for context
+                separators=["\n\n", "\n", ". ", "! ", "? ", " ", ""]
             )
 
             self.initialized = True
-            logger.info("High-performance RAG engine initialized successfully")
+            logger.info("Intelligent RAG engine initialized successfully")
             
         except Exception as e:
             logger.error(f"Failed to initialize RAG engine: {str(e)}")
             raise
 
-    def _high_accuracy_rag_query(self, vectorstore: OptimizedVectorStore, query: str) -> str:
-        """High-accuracy batch processing with optimized context"""
+    def _intelligent_query(self, vectorstore: IntelligentVectorStore, query: str) -> str:
+        """Intelligent query processing with enhanced context"""
         try:
-            # Get relevant documents for the combined query
-            docs = vectorstore.similarity_search(query, k=4)
+            docs = vectorstore.similarity_search(query, k=6)  # More context for accuracy
+            context = " ".join([doc.page_content for doc in docs])[:3000]  # Larger context window
             
-            # Maintain quality context - balanced size for speed
-            context = " ".join([doc.page_content for doc in docs])[:2500]
-            
-            # High-quality system prompt for accuracy
-            system_prompt = """You are an expert document assistant with high accuracy standards.
+            system_prompt = """You are an expert document analysis assistant with exceptional accuracy.
 
 CRITICAL INSTRUCTIONS:
 - Input questions are separated by " | "
 - Output answers MUST be separated by " | " in the same order
-- Provide detailed, accurate answers based strictly on the document content
-- If information is not in the document, clearly state "Information not found in document"
-- Maintain the exact question order in your responses
-- Use specific details and quotes from the document when available
+- Provide comprehensive, accurate answers based strictly on document content
+- Include specific details, numbers, percentages, and quotes when available
+- If information is not in document, state "Information not available in provided document"
+- Maintain exact question order in responses
+- Use technical precision and specific terminology from the document
 
-Quality Guidelines:
-- Prioritize accuracy over brevity
-- Include relevant context and details
-- Reference specific sections when possible
-- Ensure each answer directly addresses its corresponding question"""
+Quality Standards:
+- Prioritize accuracy and completeness
+- Include relevant context and supporting details
+- Reference specific sections, clauses, or provisions when possible
+- Ensure each answer comprehensively addresses its question"""
 
-            human_prompt = f"""Questions: {query}
+            human_prompt = f"""Document Context: {context}
 
-Document Context: {context}
+Questions: {query}
 
-Please provide detailed, accurate answers to each question based on the document content."""
+Provide detailed, accurate answers based on the document content."""
 
-            # Use optimized message structure
             from langchain_core.messages import HumanMessage, SystemMessage
             
             messages = [
@@ -238,11 +231,11 @@ Please provide detailed, accurate answers to each question based on the document
             return response.content
             
         except Exception as e:
-            logger.error(f"RAG query error: {e}")
+            logger.error(f"Query processing error: {e}")
             raise
 
-    def _load_and_process_document_fast(self, url: str) -> tuple:
-        """Fast document loading with caching"""
+    def _load_and_process_document(self, url: str) -> tuple:
+        """Load and process with intelligent caching"""
         if url in self.document_cache:
             logger.info(f"Using cached document for {url}")
             return self.document_cache[url]
@@ -251,11 +244,11 @@ Please provide detailed, accurate answers to each question based on the document
         start_time = time.time()
         
         try:
-            docs = load_document_content_optimized(url)
+            docs = smart_document_loader(url)
             chunks = self.text_splitter.split_documents(docs)
             
             load_time = time.time() - start_time
-            logger.info(f"Document loaded and chunked in {load_time:.2f}s ({len(chunks)} chunks)")
+            logger.info(f"Document processed in {load_time:.2f}s ({len(chunks)} chunks)")
             
             # Cache management
             if len(self.document_cache) >= self.max_cache_size:
@@ -269,37 +262,17 @@ Please provide detailed, accurate answers to each question based on the document
             logger.error(f"Failed to load document {url}: {e}")
             raise HTTPException(status_code=400, detail=f"Failed to load document: {str(e)}")
 
-    def _create_vectorstore_optimized(self, url: str, chunks: List) -> OptimizedVectorStore:
-        """High-speed vectorstore creation with parallel processing"""
-        logger.info(f"Creating optimized vectorstore for {url}")
+    def _create_vectorstore_fast(self, url: str, chunks: List) -> IntelligentVectorStore:
+        """Fast vectorstore creation with intelligent batching"""
+        logger.info(f"Creating vectorstore for {url}")
         start_time = time.time()
         
         try:
-            vectorstore = OptimizedVectorStore(self.embeddings)
-            
-            # Optimal batch processing for speed
-            batch_size = 12  # Optimal for Together.AI rate limits and speed
-            total_batches = (len(chunks) - 1) // batch_size + 1
-            
-            logger.info(f"Processing {len(chunks)} chunks in {total_batches} batches")
-            
-            # Use parallel processing for speed
-            with ThreadPoolExecutor(max_workers=2) as executor:
-                futures = []
-                
-                for i in range(0, len(chunks), batch_size):
-                    batch = chunks[i:i + batch_size]
-                    future = executor.submit(vectorstore.add_documents, batch)
-                    futures.append(future)
-                
-                # Wait for completion with progress tracking
-                for i, future in enumerate(futures):
-                    future.result(timeout=8)  # 8 second timeout per batch
-                    if i % 2 == 0 or i == len(futures) - 1:  # Log progress
-                        logger.info(f"Completed batch {i+1}/{len(futures)}")
+            vectorstore = IntelligentVectorStore(self.embeddings)
+            vectorstore.add_documents_batch(chunks)
             
             creation_time = time.time() - start_time
-            logger.info(f"Optimized vectorstore created in {creation_time:.2f}s")
+            logger.info(f"Vectorstore created in {creation_time:.2f}s")
             
             return vectorstore
             
@@ -307,70 +280,52 @@ Please provide detailed, accurate answers to each question based on the document
             logger.error(f"Vectorstore creation error: {e}")
             raise HTTPException(status_code=500, detail="Failed to create vectorstore")
 
-    def process_document_questions_optimized(self, url: str, questions: List[str]) -> List[str]:
-        """High-performance processing with timeout protection"""
+    async def process_questions_intelligent(self, url: str, questions: List[str]) -> List[str]:
+        """Intelligent processing with timeout protection"""
         if not self.initialized:
             raise RuntimeError("RAG engine not initialized")
-        
-        # Timeout protection - 27 seconds to stay under 30
-        def timeout_handler(signum, frame):
-            raise TimeoutError("Processing timeout - document too large or complex")
-        
-        signal.signal(signal.SIGALRM, timeout_handler)
-        signal.alarm(27)  # 27-second timeout
         
         total_start_time = time.time()
         
         try:
-            # Fast document loading and processing
-            docs, chunks = self._load_and_process_document_fast(url)
-            
-            # Check if we're running out of time
-            if time.time() - total_start_time > 18:
-                raise TimeoutError("Document processing taking too long")
-            
-            # Create optimized vectorstore
-            vectorstore = self._create_vectorstore_optimized(url, chunks)
-            
-            # Process ALL questions together for consistency and speed
-            logger.info(f"Processing {len(questions)} questions with high accuracy...")
-            batch_query = " | ".join(questions)
-            
-            query_start_time = time.time()
-            batch_result = self._high_accuracy_rag_query(vectorstore, batch_query)
-            query_time = time.time() - query_start_time
-            
-            logger.info(f"High-quality LLM query completed in {query_time:.2f}s")
-            
-            # Careful answer parsing to maintain accuracy
-            answers = [answer.strip() for answer in batch_result.split(" | ")]
-            
-            # Quality validation - ensure we have good answers
-            if len(answers) != len(questions):
-                logger.warning(f"Answer count mismatch: {len(questions)} questions, {len(answers)} answers")
-                if len(answers) < len(questions):
-                    for i in range(len(answers), len(questions)):
-                        answers.append("Unable to generate answer - please try rephrasing the question.")
-                answers = answers[:len(questions)]
-            
-            total_time = time.time() - total_start_time
-            logger.info(f"High-performance processing completed in {total_time:.2f}s")
-            
-            return answers
+            # Process with 25-second timeout for safety
+            return await asyncio.wait_for(
+                self._process_questions_internal(url, questions),
+                timeout=25.0
+            )
+        except asyncio.TimeoutError:
+            logger.error("Processing timeout - document too complex")
+            raise HTTPException(status_code=408, detail="Request timeout - please try a smaller document or fewer questions")
 
-        except TimeoutError as e:
-            logger.error(f"Timeout error: {str(e)}")
-            raise HTTPException(status_code=408, detail="Request timeout - document too large or complex")
-        except Exception as e:
-            logger.error(f"Error in high-performance processing: {str(e)}")
-            raise
-        finally:
-            signal.alarm(0)  # Cancel the alarm
+    async def _process_questions_internal(self, url: str, questions: List[str]) -> List[str]:
+        """Internal processing logic"""
+        docs, chunks = self._load_and_process_document(url)
+        vectorstore = self._create_vectorstore_fast(url, chunks)
+        
+        logger.info(f"Processing {len(questions)} questions intelligently...")
+        batch_query = " | ".join(questions)
+        
+        query_start_time = time.time()
+        batch_result = self._intelligent_query(vectorstore, batch_query)
+        query_time = time.time() - query_start_time
+        
+        logger.info(f"Intelligent query completed in {query_time:.2f}s")
+        
+        answers = [answer.strip() for answer in batch_result.split(" | ")]
+        
+        # Quality validation
+        if len(answers) != len(questions):
+            logger.warning(f"Answer count mismatch: {len(questions)} questions, {len(answers)} answers")
+            if len(answers) < len(questions):
+                for i in range(len(answers), len(questions)):
+                    answers.append("Unable to process this question - please rephrase or try individually.")
+            answers = answers[:len(questions)]
+        
+        return answers
 
-# Global RAG engine instance
-rag_engine = HighPerformanceRAGEngine()
+# Global engine instance
+rag_engine = IntelligentRAGEngine()
 
-# Token Verifier
 def verify_token(authorization: Optional[str] = Header(None)):
     if authorization is None or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Authorization header missing or invalid format")
@@ -379,31 +334,24 @@ def verify_token(authorization: Optional[str] = Header(None)):
     if token != EXPECTED_TOKEN:
         raise HTTPException(status_code=403, detail="Invalid Bearer token")
 
-# Lifespan Management
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup
     try:
         rag_engine.initialize()
-        logger.info("High-performance application startup completed successfully")
+        logger.info("Intelligent RAG application startup completed")
     except Exception as e:
         logger.error(f"Startup error: {str(e)}")
-        logger.info("Continuing with limited functionality...")
-    
     yield
-    
-    # Shutdown
     logger.info("Application shutting down...")
 
-# FastAPI App
-app = FastAPI(title="High-Performance Railway RAG API", version="2.0.0", lifespan=lifespan)
+app = FastAPI(title="Intelligent Batch RAG API", version="2.0.0", lifespan=lifespan)
 
 @app.post("/hackrx/run", response_model=AnswerResponse)
 async def ask_questions(
     request: QuestionRequest,
     authorization: str = Depends(verify_token)
 ):
-    """Optimized endpoint for high-performance document processing"""
+    """Intelligent batch processing endpoint"""
     try:
         logger.info(f"Received request with {len(request.questions)} questions")
 
@@ -411,10 +359,10 @@ async def ask_questions(
             raise HTTPException(status_code=400, detail="Invalid document URL")
         if not request.questions:
             raise HTTPException(status_code=400, detail="Questions list is empty")
-        if len(request.questions) > 15:  # Limit for performance
-            raise HTTPException(status_code=400, detail="Maximum 15 questions allowed per request")
+        if len(request.questions) > 20:
+            raise HTTPException(status_code=400, detail="Maximum 20 questions allowed per request")
 
-        answers = rag_engine.process_document_questions_optimized(request.documents, request.questions)
+        answers = await rag_engine.process_questions_intelligent(request.documents, request.questions)
 
         logger.info(f"Successfully processed {len(answers)} answers")
         return {"answers": answers}
@@ -427,21 +375,18 @@ async def ask_questions(
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint"""
     return {
         "status": "healthy",
         "rag_initialized": rag_engine.initialized,
         "cached_documents": len(rag_engine.document_cache),
         "timestamp": datetime.now().isoformat(),
-        "performance_mode": "optimized"
+        "mode": "intelligent_batch"
     }
 
 @app.get("/")
 async def root():
-    """Root endpoint"""
-    return {"message": "High-Performance RAG API is running", "endpoints": ["/hackrx/run", "/health"]}
+    return {"message": "Intelligent Batch RAG API", "endpoints": ["/hackrx/run", "/health"]}
 
-# Railway startup
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
