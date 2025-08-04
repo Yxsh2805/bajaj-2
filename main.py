@@ -17,10 +17,14 @@ import asyncio
 from fastapi import FastAPI, HTTPException, Header, Depends
 from pydantic import BaseModel
 
-# RAG imports - SIMPLIFIED to avoid init errors
-from langchain_together import ChatTogether, TogetherEmbeddings
+# RAG imports
+from langchain_together import ChatTogether
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+# LOCAL EMBEDDING imports
+from sentence_transformers import SentenceTransformer
+from sklearn.metrics.pairwise import cosine_similarity
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -35,70 +39,57 @@ class QuestionRequest(BaseModel):
 class AnswerResponse(BaseModel):
     answers: List[str]
 
-class OptimizedSingleCallVectorStore:
-    def __init__(self, embeddings):
-        self.embeddings = embeddings
+class LocalEmbeddingVectorStore:
+    def __init__(self):
+        # Load the local embedding model ONCE when the class is created
+        logger.info("Loading local embedding model...")
+        self.model = SentenceTransformer('all-MiniLM-L6-v2')  # 80MB model, fast and accurate
+        logger.info("Local embedding model loaded successfully")
+        
         self.documents = []
         self.vectors = []
     
-    def add_documents_optimized(self, documents: List[Document]):
-        """Optimized embedding generation with controlled batching"""
-        logger.info(f"Optimized processing {len(documents)} chunks for single LLM call")
+    def add_documents_local_batch(self, documents: List[Document]):
+        """ULTRA-FAST: Process ALL documents in ONE batch call"""
+        logger.info(f"LOCAL BATCH: Processing {len(documents)} chunks in ONE call")
         
-        batch_size = 12  # Optimal batch size for Together.AI stability
+        start_time = time.time()
         
-        for i in range(0, len(documents), batch_size):
-            batch = documents[i:i + batch_size]
-            batch_start = time.time()
-            
-            for j, doc in enumerate(batch):
-                try:
-                    vector = self.embeddings.embed_query(doc.page_content)
-                    self.documents.append(doc)
-                    self.vectors.append(vector)
-                    
-                    if j < len(batch) - 1:
-                        time.sleep(0.05)  # 50ms delay between calls
-                        
-                except Exception as e:
-                    logger.error(f"Embedding error for chunk {len(self.documents)}: {e}")
-                    continue
-            
-            batch_num = (i // batch_size) + 1
-            total_batches = (len(documents) - 1) // batch_size + 1
-            batch_time = time.time() - batch_start
-            
-            logger.info(f"Embedding batch {batch_num}/{total_batches} completed in {batch_time:.2f}s")
-            
-            if batch_num < total_batches:
-                time.sleep(0.8)  # 800ms between batches
+        # Extract all text content
+        texts = [doc.page_content for doc in documents]
+        
+        # SINGLE batch embedding call - NO individual API calls!
+        logger.info("Generating embeddings with local model...")
+        embeddings = self.model.encode(
+            texts,
+            batch_size=32,  # Process 32 chunks simultaneously
+            show_progress_bar=False,  # Disable for cleaner logs
+            convert_to_numpy=True
+        )
+        
+        # Store results
+        self.documents = documents
+        self.vectors = embeddings
+        
+        embedding_time = time.time() - start_time
+        logger.info(f"LOCAL BATCH: Completed in {embedding_time:.2f}s ({len(documents)} chunks)")
     
     def similarity_search(self, query: str, k: int = 6) -> List[Document]:
-        """Fast similarity search for single LLM call"""
-        if not self.vectors:
+        """Fast local similarity search"""
+        if len(self.vectors) == 0:
             return []
         
-        try:
-            query_vector = self.embeddings.embed_query(query)
-            
-            similarities = []
-            for i, vector in enumerate(self.vectors):
-                dot_product = np.dot(query_vector, vector)
-                norm_product = np.linalg.norm(query_vector) * np.linalg.norm(vector)
-                similarity = dot_product / norm_product if norm_product > 0 else 0
-                similarities.append((similarity, i))
-            
-            similarities.sort(key=lambda x: x[0], reverse=True)
-            top_indices = [idx for _, idx in similarities[:k]]
-            
-            return [self.documents[i] for i in top_indices]
-            
-        except Exception as e:
-            logger.error(f"Similarity search error: {e}")
-            return self.documents[:k] if len(self.documents) >= k else self.documents
+        # Single query embedding
+        query_embedding = self.model.encode([query], convert_to_numpy=True)
+        
+        # Fast similarity calculation
+        similarities = cosine_similarity(query_embedding, self.vectors)[0]
+        top_indices = np.argsort(similarities)[-k:][::-1]
+        
+        return [self.documents[i] for i in top_indices]
 
 def optimized_document_loader(url: str) -> List[Document]:
-    """Optimized document loading for single call processing"""
+    """Optimized document loading"""
     try:
         response = requests.get(url, timeout=15, headers={'User-Agent': 'Mozilla/5.0'})
         response.raise_for_status()
@@ -111,9 +102,11 @@ def optimized_document_loader(url: str) -> List[Document]:
             pdf_reader = PyPDF2.PdfReader(pdf_file)
             total_pages = len(pdf_reader.pages)
             
+            # Process all pages for documents up to 30 pages
             if total_pages <= 30:
                 pages_to_process = list(range(total_pages))
             else:
+                # Smart sampling for larger documents
                 first_pages = list(range(15))
                 middle_pages = list(range(total_pages//3, total_pages//3 + 10))
                 last_pages = list(range(total_pages-10, total_pages))
@@ -128,7 +121,7 @@ def optimized_document_loader(url: str) -> List[Document]:
                     if (i + 1) % 10 == 0:
                         logger.info(f"Processed {i+1} pages")
             
-            logger.info(f"Optimized processing: {len(pages_to_process)}/{total_pages} pages")
+            logger.info(f"Document processing: {len(pages_to_process)}/{total_pages} pages")
             return [Document(page_content=text.strip(), metadata={"source": url, "type": "pdf"})]
         
         elif url_lower.endswith('.docx') or 'wordprocessingml' in content_type:
@@ -163,10 +156,9 @@ def optimized_document_loader(url: str) -> List[Document]:
         logger.error(f"Failed to load document {url}: {e}")
         raise
 
-class SingleCallRAGEngine:
+class LocalEmbeddingRAGEngine:
     def __init__(self):
         self.chat_model = None
-        self.embeddings = None
         self.text_splitter = None
         self.initialized = False
         self.document_cache: Dict[str, Any] = {}
@@ -176,22 +168,23 @@ class SingleCallRAGEngine:
         return hashlib.md5(url.encode()).hexdigest()[:12]
     
     def initialize(self):
-        """Initialize for single LLM call processing"""
+        """Initialize LOCAL embedding RAG engine"""
         if self.initialized:
             return
             
-        logger.info("Initializing single-call RAG engine...")
+        logger.info("Initializing LOCAL embedding RAG engine...")
         
         try:
             os.environ["TOGETHER_API_KEY"] = os.getenv("TOGETHER_API_KEY", "deb14836869b48e01e1853f49381b9eb7885e231ead3bc4f6bbb4a5fc4570b78")
             
-            self.embeddings = TogetherEmbeddings(model="BAAI/bge-base-en-v1.5")
+            # Only need Together.AI for the chat model (NOT for embeddings)
             self.chat_model = ChatTogether(
                 model="meta-llama/Llama-3.3-70B-Instruct-Turbo-Free",
                 temperature=0,
                 max_tokens=4000
             )
 
+            # Text splitter - same as before
             self.text_splitter = RecursiveCharacterTextSplitter(
                 chunk_size=1000,
                 chunk_overlap=100,
@@ -199,19 +192,19 @@ class SingleCallRAGEngine:
             )
 
             self.initialized = True
-            logger.info("Single-call RAG engine initialized successfully")
+            logger.info("LOCAL embedding RAG engine initialized successfully")
             
         except Exception as e:
             logger.error(f"Failed to initialize RAG engine: {str(e)}")
             raise
 
-    def _single_call_query(self, vectorstore: OptimizedSingleCallVectorStore, query: str) -> str:
-        """SIMPLE: Single LLM call using direct message approach"""
+    def _single_call_query(self, vectorstore: LocalEmbeddingVectorStore, query: str) -> str:
+        """Single LLM call for all questions"""
         try:
             docs = vectorstore.similarity_search(query, k=6)
             context = " ".join([doc.page_content for doc in docs])[:3500]
             
-            # Use direct message approach - NO ChatPromptTemplate
+            # Use direct message approach
             from langchain_core.messages import HumanMessage, SystemMessage
             
             system_content = """You are a helpful assistant who is an expert in explaining insurance policies and their application to general queries.
@@ -259,7 +252,7 @@ Here are some relevant excerpts that might be useful for you in answering the qu
             logger.info(f"Using cached document for {url}")
             return self.document_cache[url]
         
-        logger.info(f"Loading document for single-call processing: {url}")
+        logger.info(f"Loading document for LOCAL processing: {url}")
         start_time = time.time()
         
         try:
@@ -280,26 +273,26 @@ Here are some relevant excerpts that might be useful for you in answering the qu
             logger.error(f"Failed to load document {url}: {e}")
             raise HTTPException(status_code=400, detail=f"Failed to load document: {str(e)}")
 
-    def _create_vectorstore_optimized(self, url: str, chunks: List) -> OptimizedSingleCallVectorStore:
-        """Create optimized vectorstore for single LLM call"""
-        logger.info(f"Creating optimized vectorstore for single LLM call")
+    def _create_vectorstore_local(self, url: str, chunks: List) -> LocalEmbeddingVectorStore:
+        """Create vectorstore with LOCAL embeddings"""
+        logger.info(f"Creating LOCAL vectorstore")
         start_time = time.time()
         
         try:
-            vectorstore = OptimizedSingleCallVectorStore(self.embeddings)
-            vectorstore.add_documents_optimized(chunks)
+            vectorstore = LocalEmbeddingVectorStore()
+            vectorstore.add_documents_local_batch(chunks)
             
             creation_time = time.time() - start_time
-            logger.info(f"Optimized vectorstore created in {creation_time:.2f}s")
+            logger.info(f"LOCAL vectorstore created in {creation_time:.2f}s")
             
             return vectorstore
             
         except Exception as e:
-            logger.error(f"Optimized vectorstore creation error: {e}")
+            logger.error(f"LOCAL vectorstore creation error: {e}")
             raise HTTPException(status_code=500, detail=f"Vectorstore creation failed: {str(e)}")
 
-    async def process_questions_single_call(self, url: str, questions: List[str]) -> List[str]:
-        """Process ALL questions in SINGLE LLM call"""
+    async def process_questions_local(self, url: str, questions: List[str]) -> List[str]:
+        """Process ALL questions with LOCAL embeddings"""
         if not self.initialized:
             raise RuntimeError("RAG engine not initialized")
         
@@ -309,15 +302,15 @@ Here are some relevant excerpts that might be useful for you in answering the qu
                 timeout=28.0
             )
         except asyncio.TimeoutError:
-            logger.error("Single-call processing timeout")
-            raise HTTPException(status_code=408, detail="Request timeout - document processing took too long")
+            logger.error("LOCAL processing timeout")
+            raise HTTPException(status_code=408, detail="Request timeout")
 
     async def _process_questions_internal(self, url: str, questions: List[str]) -> List[str]:
         """Internal processing logic"""
         docs, chunks = self._load_and_process_document(url)
-        vectorstore = self._create_vectorstore_optimized(url, chunks)
+        vectorstore = self._create_vectorstore_local(url, chunks)
         
-        logger.info(f"Processing {len(questions)} questions in SINGLE LLM call...")
+        logger.info(f"Processing {len(questions)} questions with LOCAL embeddings...")
         batch_query = " | ".join(questions)
         
         query_start_time = time.time()
@@ -338,7 +331,7 @@ Here are some relevant excerpts that might be useful for you in answering the qu
         return answers
 
 # Global RAG engine instance
-rag_engine = SingleCallRAGEngine()
+rag_engine = LocalEmbeddingRAGEngine()
 
 def verify_token(authorization: Optional[str] = Header(None)):
     if authorization is None or not authorization.startswith("Bearer "):
@@ -352,31 +345,31 @@ def verify_token(authorization: Optional[str] = Header(None)):
 async def lifespan(app: FastAPI):
     try:
         rag_engine.initialize()
-        logger.info("Single-call RAG application startup completed")
+        logger.info("LOCAL embedding RAG application startup completed")
     except Exception as e:
         logger.error(f"Startup error: {str(e)}")
     yield
     logger.info("Application shutting down...")
 
-app = FastAPI(title="Single-Call RAG API", version="3.0.0", lifespan=lifespan)
+app = FastAPI(title="LOCAL Embedding RAG API", version="3.0.0", lifespan=lifespan)
 
 @app.post("/hackrx/run", response_model=AnswerResponse)
 async def ask_questions(
     request: QuestionRequest,
     authorization: str = Depends(verify_token)
 ):
-    """Single LLM call processing - handles unlimited questions"""
+    """LOCAL embedding processing - ULTRA FAST"""
     try:
-        logger.info(f"Received request with {len(request.questions)} questions for single-call processing")
+        logger.info(f"Received request with {len(request.questions)} questions for LOCAL processing")
 
         if not request.documents.startswith(('http://', 'https://')):
             raise HTTPException(status_code=400, detail="Invalid document URL")
         if not request.questions:
             raise HTTPException(status_code=400, detail="Questions list is empty")
 
-        answers = await rag_engine.process_questions_single_call(request.documents, request.questions)
+        answers = await rag_engine.process_questions_local(request.documents, request.questions)
 
-        logger.info(f"Successfully processed {len(answers)} answers with SINGLE LLM call")
+        logger.info(f"Successfully processed {len(answers)} answers with LOCAL embeddings")
         return {"answers": answers}
 
     except HTTPException:
@@ -392,12 +385,12 @@ async def health_check():
         "rag_initialized": rag_engine.initialized,
         "cached_documents": len(rag_engine.document_cache),
         "timestamp": datetime.now().isoformat(),
-        "mode": "single_llm_call"
+        "mode": "local_embeddings"
     }
 
 @app.get("/")
 async def root():
-    return {"message": "Single-Call RAG API - One LLM call for all questions", "endpoints": ["/hackrx/run", "/health"]}
+    return {"message": "LOCAL Embedding RAG API - Ultra Fast Processing", "endpoints": ["/hackrx/run", "/health"]}
 
 if __name__ == "__main__":
     import uvicorn
