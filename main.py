@@ -64,8 +64,8 @@ class BalancedVectorStore:
                     logger.warning(f"Failed to embed chunk: {str(e)[:50]}")
                     return None
         
-        # 10 workers - conservative for Google API rate limits
-        with ThreadPoolExecutor(max_workers=10) as executor:
+        # 8 workers - conservative for Google API rate limits
+        with ThreadPoolExecutor(max_workers=8) as executor:
             vectors = list(executor.map(embed_with_simple_retry, documents))
         
         # Store successful results
@@ -179,16 +179,21 @@ class BalancedRAGEngine:
         logger.info("Initializing BALANCED RAG engine with Google Gemini...")
         
         try:
-            # Configure Google Generative AI
-            genai.configure(api_key="AIzaSyA2FLkqwfhTBdNs5GQTFntG7jclk_hDmeQ")
+            # FIXED: Set API key as environment variable (avoids SecretStr issue)
+            API_KEY = "AIzaSyA2FLkqwfhTBdNs5GQTFntG7jclk_hDmeQ"
+            os.environ["GOOGLE_API_KEY"] = API_KEY
+            
+            # Configure Google Generative AI with plain string
+            genai.configure(api_key=API_KEY)
             
             # Together AI for chat model
             os.environ["TOGETHER_API_KEY"] = os.getenv("TOGETHER_API_KEY", "deb14836869b48e01e1853f49381b9eb7885e231ead3bc4f6bbb4a5fc4570b78")
             
-            # Google Gemini for embeddings (FREE!)
+            # FIXED: Google Gemini embeddings - NO google_api_key parameter
+            # This lets LangChain read from environment variable as plain string
             self.embeddings = GoogleGenerativeAIEmbeddings(
-                model="models/embedding-001",
-                google_api_key="AIzaSyA2FLkqwfhTBdNs5GQTFntG7jclk_hDmeQ"
+                model="models/embedding-001"
+                # NO google_api_key parameter - avoids SecretStr wrapping
             )
             
             self.chat_model = ChatTogether(
@@ -205,7 +210,7 @@ class BalancedRAGEngine:
             )
 
             self.initialized = True
-            logger.info("BALANCED RAG engine with Google Gemini ready!")
+            logger.info("BALANCED RAG engine with Google Gemini ready! (Fixed SecretStr issue)")
             
         except Exception as e:
             logger.error(f"Initialization error: {e}")
@@ -261,7 +266,7 @@ Provide detailed, accurate answers separated by " | " in the same order."""
         try:
             return await asyncio.wait_for(
                 self._process_internal(url, questions),
-                timeout=60.0  # Increased timeout for Google API
+                timeout=60.0
             )
         except asyncio.TimeoutError:
             raise HTTPException(status_code=408, detail="Processing timeout")
@@ -331,19 +336,19 @@ def verify_token(authorization: Optional[str] = Header(None)):
 async def lifespan(app: FastAPI):
     try:
         rag_engine.initialize()
-        logger.info("GOOGLE GEMINI RAG application ready")
+        logger.info("GOOGLE GEMINI RAG application ready (FIXED)")
     except Exception as e:
         logger.error(f"Startup error: {e}")
     yield
 
-app = FastAPI(title="GOOGLE GEMINI RAG API", version="3.0.0", lifespan=lifespan)
+app = FastAPI(title="GOOGLE GEMINI RAG API (FIXED)", version="3.0.0", lifespan=lifespan)
 
 @app.post("/hackrx/run", response_model=AnswerResponse)
 async def ask_questions(
     request: QuestionRequest,
     authorization: str = Depends(verify_token)
 ):
-    """Balanced processing with Google Gemini - FREE and reliable"""
+    """Balanced processing with Google Gemini - FREE and reliable (FIXED)"""
     try:
         logger.info(f"GOOGLE GEMINI processing: {len(request.questions)} questions")
 
@@ -368,13 +373,13 @@ async def health_check():
     return {
         "status": "healthy",
         "cache_entries": len(rag_engine.vectorstore_cache),
-        "mode": "google_gemini_embeddings",
-        "embedding_provider": "Google Gemini API (FREE)"
+        "mode": "google_gemini_embeddings_fixed",
+        "embedding_provider": "Google Gemini API (FREE - FIXED)"
     }
 
 @app.get("/")
 async def root():
-    return {"message": "GOOGLE GEMINI RAG API - FREE, Fast & Reliable"}
+    return {"message": "GOOGLE GEMINI RAG API - FREE, Fast & Reliable (FIXED)"}
 
 if __name__ == "__main__":
     import uvicorn
