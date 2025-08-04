@@ -19,7 +19,9 @@ from fastapi import FastAPI, HTTPException, Header, Depends
 from pydantic import BaseModel
 
 # RAG imports
-from langchain_together import ChatTogether, TogetherEmbeddings
+from langchain_together import ChatTogether
+from langchain_openai import OpenAIEmbeddings
+
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
@@ -177,7 +179,10 @@ class BalancedRAGEngine:
         
         os.environ["TOGETHER_API_KEY"] = os.getenv("TOGETHER_API_KEY", "deb14836869b48e01e1853f49381b9eb7885e231ead3bc4f6bbb4a5fc4570b78")
         
-        self.embeddings = TogetherEmbeddings(model="BAAI/bge-base-en-v1.5")
+        self.embeddings = self.embeddings = OpenAIEmbeddings(
+            model="text-embedding-3-small",
+            openai_api_key=os.getenv("OPENAI_API_KEY")
+        )
         self.chat_model = ChatTogether(
             model="meta-llama/Llama-3.3-70B-Instruct-Turbo-Free",
             temperature=0,
@@ -362,3 +367,4 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
+
