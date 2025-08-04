@@ -417,7 +417,15 @@ async def health_check():
 async def root():
     return {"message": "PARALLEL RAG API - 8x Faster Embedding Processing", "endpoints": ["/hackrx/run", "/health"]}
 
+# Increase gunicorn worker timeout if using gunicorn
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run(
+        app, 
+        host="0.0.0.0", 
+        port=port,
+        timeout_keep_alive=120  # Increase keep-alive timeout
+    )
+
+
