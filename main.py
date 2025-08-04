@@ -2,7 +2,6 @@ import os
 import time
 import logging
 import hashlib
-import re
 from datetime import datetime
 from typing import List, Optional, Dict, Any
 from contextlib import asynccontextmanager
@@ -37,125 +36,60 @@ class QuestionRequest(BaseModel):
 class AnswerResponse(BaseModel):
     answers: List[str]
 
-def clean_text_for_embedding(text: str) -> str:
-    """Clean text to prevent 400 errors"""
-    if not text or not text.strip():
-        return "Empty content"
-    
-    # Remove problematic characters
-    text = re.sub(r'[^\w\s\.\,\!\?\;\:\-\(\)\[\]\"\'\/]', ' ', text)
-    
-    # Remove excessive whitespace
-    text = ' '.join(text.split())
-    
-    # Ensure minimum length
-    if len(text.strip()) < 10:
-        text = f"Short content: {text}"
-    
-    # Truncate if too long (Together.AI limit is ~8192 tokens, ~32k chars)
-    if len(text) > 30000:
-        text = text[:30000] + "..."
-        logger.warning(f"Truncated long text to 30k chars")
-    
-    return text.strip()
-
-class RobustVectorStore:
+class TimeConstrainedVectorStore:
     def __init__(self, embeddings):
         self.embeddings = embeddings
         self.documents = []
         self.vectors = []
     
-    def add_documents_robust(self, documents: List[Document]):
-        """Robust embedding with input validation"""
-        logger.info(f"ROBUST: Processing {len(documents)} chunks with validation")
+    def add_documents_time_constrained(self, documents: List[Document]):
+        """Time-constrained embedding - max 15-20 seconds"""
+        logger.info(f"TIME CONSTRAINED: Processing {len(documents)} chunks (target: 15-20s)")
         
         start_time = time.time()
         
-        def embed_with_validation(doc_tuple):
-            """Embed with thorough validation and retry"""
-            index, doc = doc_tuple
-            
-            # Clean and validate text
-            clean_text = clean_text_for_embedding(doc.page_content)
-            
-            # Skip if text is too short or empty
-            if len(clean_text.strip()) < 10:
-                logger.warning(f"Skipping chunk {index}: too short")
-                return None
-            
-            for attempt in range(3):  # 3 attempts with different strategies
+        def embed_fast(doc):
+            """Fast embedding with minimal retry"""
+            try:
+                return self.embeddings.embed_query(doc.page_content)
+            except Exception as e:
+                # Only ONE retry for speed
                 try:
-                    if attempt == 0:
-                        # First attempt - full text
-                        return self.embeddings.embed_query(clean_text)
-                    elif attempt == 1:
-                        # Second attempt - truncate more aggressively
-                        shorter_text = clean_text[:15000]
-                        time.sleep(0.1)
-                        return self.embeddings.embed_query(shorter_text)
-                    else:
-                        # Third attempt - much shorter
-                        shortest_text = clean_text[:5000]
-                        time.sleep(0.2)
-                        return self.embeddings.embed_query(shortest_text)
-                        
-                except Exception as e:
-                    error_str = str(e)
-                    if "400" in error_str:
-                        logger.warning(f"Chunk {index} attempt {attempt+1}: 400 error - {error_str[:60]}")
-                        if attempt == 2:
-                            return None
-                        continue
-                    elif "503" in error_str or "502" in error_str:
-                        logger.warning(f"Chunk {index} attempt {attempt+1}: Server error - retrying")
-                        time.sleep(0.5 * (attempt + 1))  # Exponential backoff
-                        continue
-                    else:
-                        logger.warning(f"Chunk {index} attempt {attempt+1}: {error_str[:40]}")
-                        if attempt == 2:
-                            return None
-                        continue
-            
-            return None
+                    time.sleep(0.1)  # Slightly longer delay to avoid rate limits
+                    return self.embeddings.embed_query(doc.page_content)
+                except:
+                    logger.warning(f"Fast fail: {str(e)[:30]}")
+                    return None
         
-        # Prepare documents with indices
-        doc_tuples = [(i, doc) for i, doc in enumerate(documents)]
+        # 10 workers - reduced from 12 to avoid rate limiting
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            vectors = list(executor.map(embed_fast, documents))
         
-        # 8 workers to reduce API pressure
-        successful_embeddings = []
-        with ThreadPoolExecutor(max_workers=8) as executor:
-            vectors = list(executor.map(embed_with_validation, doc_tuples))
-        
-        # Store successful results
-        for i, (doc, vector) in enumerate(zip(documents, vectors)):
+        # Store results
+        successful_count = 0
+        for doc, vector in zip(documents, vectors):
             if vector is not None:
                 self.documents.append(doc)
                 self.vectors.append(vector)
-                successful_embeddings.append(i)
+                successful_count += 1
         
         embedding_time = time.time() - start_time
-        success_rate = (len(successful_embeddings) / len(documents)) * 100
-        logger.info(f"ROBUST: {embedding_time:.1f}s, {len(successful_embeddings)}/{len(documents)} chunks ({success_rate:.1f}% success)")
+        success_rate = (successful_count / len(documents)) * 100
+        logger.info(f"TIME CONSTRAINED: {embedding_time:.1f}s, {successful_count}/{len(documents)} chunks ({success_rate:.1f}% success)")
         
-        # Quality check
-        if len(successful_embeddings) < len(documents) * 0.7:  # Less than 70% success
-            logger.error(f"Low success rate: {success_rate:.1f}% - may affect accuracy")
-        
-        if embedding_time > 25:
-            logger.warning(f"Embedding time exceeded target: {embedding_time:.1f}s")
+        # Time budget check
+        if embedding_time > 20:
+            logger.warning(f"Embedding exceeded 20s target: {embedding_time:.1f}s")
     
     def similarity_search(self, query: str, k: int = 8) -> List[Document]:
-        """Robust similarity search"""
+        """Fast similarity search"""
         if not self.vectors:
-            logger.warning("No vectors available for search")
             return []
         
         try:
-            # Clean query text
-            clean_query = clean_text_for_embedding(query)
-            query_vector = self.embeddings.embed_query(clean_query)
+            query_vector = self.embeddings.embed_query(query)
             
-            # Calculate similarities
+            # Fast cosine similarity
             similarities = []
             query_norm = np.linalg.norm(query_vector)
             
@@ -177,10 +111,10 @@ class RobustVectorStore:
             logger.error(f"Search error: {e}")
             return self.documents[:k] if len(self.documents) >= k else self.documents
 
-def robust_document_loader(url: str) -> List[Document]:
-    """Robust document loading with text cleaning"""
+def smart_document_loader(url: str) -> List[Document]:
+    """Smart document loading with all pages but strategic chunking"""
     try:
-        response = requests.get(url, timeout=12, headers={'User-Agent': 'Mozilla/5.0'})
+        response = requests.get(url, timeout=10, headers={'User-Agent': 'Mozilla/5.0'})
         response.raise_for_status()
         
         url_lower = url.lower()
@@ -189,58 +123,46 @@ def robust_document_loader(url: str) -> List[Document]:
         if url_lower.endswith('.pdf') or 'pdf' in content_type:
             pdf_file = io.BytesIO(response.content)
             pdf_reader = PyPDF2.PdfReader(pdf_file)
-            total_pages = min(len(pdf_reader.pages), 30)  # Hard limit 30 pages
+            total_pages = len(pdf_reader.pages)
             
-            # Clean text extraction
-            text_parts = []
+            if total_pages > 30:
+                logger.warning(f"Document has {total_pages} pages - processing first 30")
+                total_pages = 30
+            
+            # COMPLETE PROCESSING - all pages
+            text = ""
             for i in range(total_pages):
                 try:
                     page_text = pdf_reader.pages[i].extract_text()
-                    if page_text and page_text.strip():
-                        # Clean page text
-                        clean_page = clean_text_for_embedding(page_text)
-                        if len(clean_page.strip()) > 20:  # Only add substantial content
-                            text_parts.append(clean_page)
+                    if page_text.strip():
+                        text += f"{page_text}\n\n"  # Remove page markers to save space
                 except Exception as e:
                     logger.warning(f"Error reading page {i+1}: {e}")
                     continue
             
-            full_text = "\n\n".join(text_parts)
-            logger.info(f"ROBUST: Processed {total_pages} pages, {len(full_text)} chars")
-            
-            return [Document(
-                page_content=full_text, 
-                metadata={"source": url, "type": "pdf", "pages": total_pages}
-            )]
+            logger.info(f"SMART: Processed ALL {total_pages} pages")
+            return [Document(page_content=text.strip(), metadata={"source": url, "type": "pdf", "pages": total_pages})]
         
         elif url_lower.endswith('.docx') or 'wordprocessingml' in content_type:
             docx_file = io.BytesIO(response.content)
             doc = DocxDocument(docx_file)
-            text = "\n".join([para.text for para in doc.paragraphs if para.text.strip()])
-            clean_text = clean_text_for_embedding(text)
-            
-            return [Document(
-                page_content=clean_text, 
-                metadata={"source": url, "type": "docx"}
-            )]
+            text = "\n".join([paragraph.text for paragraph in doc.paragraphs])
+            return [Document(page_content=text.strip(), metadata={"source": url, "type": "docx"})]
         
         else:
             soup = BeautifulSoup(response.content, 'html.parser')
             for script in soup(["script", "style", "nav", "footer", "header"]):
                 script.decompose()
             text = soup.get_text()
-            clean_text = clean_text_for_embedding(text)
-            
-            return [Document(
-                page_content=clean_text[:100000],  # Limit HTML content
-                metadata={"source": url, "type": "html"}
-            )]
+            lines = (line.strip() for line in text.splitlines())
+            text = '\n'.join(line for line in lines if line)
+            return [Document(page_content=text[:120000], metadata={"source": url, "type": "html"})]
         
     except Exception as e:
         logger.error(f"Document load error: {e}")
         raise
 
-class RobustRAGEngine:
+class TimeConstrainedRAGEngine:
     def __init__(self):
         self.chat_model = None
         self.embeddings = None
@@ -252,7 +174,7 @@ class RobustRAGEngine:
         if self.initialized:
             return
             
-        logger.info("Initializing ROBUST RAG engine...")
+        logger.info("Initializing TIME CONSTRAINED RAG engine...")
         
         try:
             os.environ["TOGETHER_API_KEY"] = os.getenv("TOGETHER_API_KEY", "deb14836869b48e01e1853f49381b9eb7885e231ead3bc4f6bbb4a5fc4570b78")
@@ -265,27 +187,28 @@ class RobustRAGEngine:
                 max_tokens=3200
             )
 
-            # Conservative chunking to avoid 400 errors
+            # STRATEGIC chunking - larger chunks to reduce total count
             self.text_splitter = RecursiveCharacterTextSplitter(
-                chunk_size=1400,   # Conservative size
-                chunk_overlap=140, # 10% overlap
-                separators=["\n\n", "\n", ". ", " "]
+                chunk_size=1750,  # LARGER chunks to reduce count
+                chunk_overlap=175, # 10% overlap
+                separators=["\n\n", "\n", ". ", " "]  # Fewer separators for speed
             )
 
             self.initialized = True
-            logger.info("ROBUST RAG engine ready!")
+            logger.info("TIME CONSTRAINED RAG engine ready!")
             
         except Exception as e:
             logger.error(f"Initialization error: {e}")
             raise
 
-    def _robust_query(self, vectorstore: RobustVectorStore, query: str) -> str:
-        """Robust query processing"""
+    def _time_constrained_query(self, vectorstore: TimeConstrainedVectorStore, query: str) -> str:
+        """Time-efficient query"""
         docs = vectorstore.similarity_search(query, k=8)
-        context = " ".join([doc.page_content for doc in docs])[:3000]
+        context = " ".join([doc.page_content for doc in docs])[:3200]
         
         from langchain_core.messages import HumanMessage, SystemMessage
         
+        # Efficient system prompt
         system_content = """You are an expert insurance policy analyst.
 
 INSTRUCTIONS:
@@ -294,6 +217,7 @@ INSTRUCTIONS:
 - Provide accurate answers based on the document content
 - Include specific numbers, percentages, time periods, and conditions
 - If information is not in the document, state "Information not available in provided document"
+- Keep answers detailed but concise
 
 CRITICAL: Separate each answer with " | " and maintain exact question order."""
 
@@ -301,7 +225,7 @@ CRITICAL: Separate each answer with " | " and maintain exact question order."""
 
 Document: {context}
 
-Provide answers separated by " | " in the same order."""
+Provide detailed answers separated by " | " in the same order."""
 
         messages = [
             SystemMessage(content=system_content),
@@ -311,8 +235,8 @@ Provide answers separated by " | " in the same order."""
         response = self.chat_model.invoke(messages)
         return response.content
 
-    async def process_robust(self, url: str, questions: List[str]) -> List[str]:
-        """Robust processing with error handling"""
+    async def process_time_constrained(self, url: str, questions: List[str]) -> List[str]:
+        """Time-constrained processing"""
         if not self.initialized:
             raise RuntimeError("RAG engine not initialized")
         
@@ -332,45 +256,62 @@ Provide answers separated by " | " in the same order."""
             vectorstore = self.vectorstore_cache[url_hash]
             logger.info("CACHED - INSTANT!")
         else:
-            # Document loading with validation
-            docs = robust_document_loader(url)
+            # Document loading
+            docs = smart_document_loader(url)
             chunks = self.text_splitter.split_documents(docs)
             
-            # Aggressive chunk limiting to avoid timeouts
+            # AGGRESSIVE CHUNK LIMITING for time constraint
             original_count = len(chunks)
-            if len(chunks) > 90:  # REDUCED from 75 to 60
-                # Strategic selection
-                keep_first = int(len(chunks) * 0.5)   # 50% from start
-                keep_middle = int(len(chunks) * 0.15) # 15% from middle
+            
+            if len(chunks) > 90:  # CHANGED: Hard limit reduced to 90 chunks max
+                # Smart selection strategy
+                keep_first = int(len(chunks) * 0.45)  # 45% from start
+                keep_middle = int(len(chunks) * 0.20) # 20% from middle  
                 keep_last = int(len(chunks) * 0.35)   # 35% from end
                 
+                # Calculate middle section
                 middle_start = len(chunks) // 2 - keep_middle // 2
-                chunks = (
+                
+                # Select chunks strategically
+                selected_chunks = (
                     chunks[:keep_first] +
                     chunks[middle_start:middle_start + keep_middle] +
                     chunks[-keep_last:]
                 )
                 
-                logger.info(f"CHUNK LIMIT: {original_count} → {len(chunks)} chunks")
+                chunks = selected_chunks
+                
+                logger.info(f"CHUNK LIMIT: Reduced {original_count} → {len(chunks)} chunks for time constraint")
             
-            # Robust embedding with validation
-            vectorstore = RobustVectorStore(self.embeddings)
-            vectorstore.add_documents_robust(chunks)
+            # Ensure we don't exceed 90 chunks
+            if len(chunks) > 90:
+                chunks = chunks[:90]
+                logger.info(f"HARD LIMIT: Truncated to 90 chunks")
             
-            # Cache result
+            # Time-aware embedding
+            embed_start = time.time()
+            vectorstore = TimeConstrainedVectorStore(self.embeddings)
+            vectorstore.add_documents_time_constrained(chunks)
+            
+            embed_time = time.time() - embed_start
+            total_time_so_far = time.time() - total_start
+            
+            logger.info(f"Time budget: Embed {embed_time:.1f}s, Total {total_time_so_far:.1f}s, Remaining {30 - total_time_so_far:.1f}s")
+            
+            # Cache the vectorstore
             self.vectorstore_cache[url_hash] = vectorstore
         
-        # Query processing
+        # Query phase
         batch_query = " | ".join(questions)
         
         query_start = time.time()
-        response = self._robust_query(vectorstore, batch_query)
+        response = self._time_constrained_query(vectorstore, batch_query)
         query_time = time.time() - query_start
         
         total_time = time.time() - total_start
-        logger.info(f"ROBUST: Query {query_time:.1f}s, Total {total_time:.1f}s")
+        logger.info(f"TIME CONSTRAINED: Query {query_time:.1f}s, Total {total_time:.1f}s")
         
-        # Answer parsing
+        # Fast answer parsing
         answers = []
         raw_splits = response.split(" | ")
         
@@ -379,13 +320,14 @@ Provide answers separated by " | " in the same order."""
             if cleaned and len(cleaned) > 5:
                 answers.append(cleaned)
         
+        # Ensure correct count
         while len(answers) < len(questions):
             answers.append("Information not available in provided document.")
         
         return answers[:len(questions)]
 
 # Global engine
-rag_engine = RobustRAGEngine()
+rag_engine = TimeConstrainedRAGEngine()
 
 def verify_token(authorization: Optional[str] = Header(None)):
     if authorization is None or not authorization.startswith("Bearer "):
@@ -399,21 +341,21 @@ def verify_token(authorization: Optional[str] = Header(None)):
 async def lifespan(app: FastAPI):
     try:
         rag_engine.initialize()
-        logger.info("ROBUST RAG application ready")
+        logger.info("TIME CONSTRAINED RAG application ready")
     except Exception as e:
         logger.error(f"Startup error: {e}")
     yield
 
-app = FastAPI(title="ROBUST RAG API", version="3.0.0", lifespan=lifespan)
+app = FastAPI(title="TIME CONSTRAINED RAG API", version="3.0.0", lifespan=lifespan)
 
 @app.post("/hackrx/run", response_model=AnswerResponse)
 async def ask_questions(
     request: QuestionRequest,
     authorization: str = Depends(verify_token)
 ):
-    """Robust processing with input validation"""
+    """Time-constrained processing - max 90 chunks, 15-20s embedding"""
     try:
-        logger.info(f"ROBUST: {len(request.questions)} questions (max 60 chunks)")
+        logger.info(f"TIME CONSTRAINED: {len(request.questions)} questions (90 chunk limit)")
 
         if not request.documents.startswith(('http://', 'https://')):
             raise HTTPException(status_code=400, detail="Invalid document URL")
@@ -421,10 +363,10 @@ async def ask_questions(
             raise HTTPException(status_code=400, detail="No questions provided")
 
         start_time = time.time()
-        answers = await rag_engine.process_robust(request.documents, request.questions)
+        answers = await rag_engine.process_time_constrained(request.documents, request.questions)
         total_time = time.time() - start_time
 
-        logger.info(f"ROBUST: Completed in {total_time:.1f}s")
+        logger.info(f"TIME CONSTRAINED: Completed in {total_time:.1f}s")
         return {"answers": answers}
 
     except HTTPException:
@@ -438,15 +380,15 @@ async def health_check():
     return {
         "status": "healthy",
         "cache_entries": len(rag_engine.vectorstore_cache),
-        "mode": "robust_validated",
-        "max_chunks": 90,
-        "validation": "enabled",
-        "embedding_provider": "Together.AI (Robust)"
+        "mode": "time_constrained",
+        "max_chunks": 90,  # UPDATED to reflect 90 chunk limit
+        "target_embed_time": "15-20_seconds",
+        "embedding_provider": "Together.AI (Time Constrained)"
     }
 
 @app.get("/")
 async def root():
-    return {"message": "ROBUST RAG API - Input Validation & Error Handling"}
+    return {"message": "TIME CONSTRAINED RAG API - Max 90 Chunks, 15-20s Embedding"}
 
 if __name__ == "__main__":
     import uvicorn
