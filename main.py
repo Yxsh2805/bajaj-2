@@ -36,37 +36,35 @@ class QuestionRequest(BaseModel):
 class AnswerResponse(BaseModel):
     answers: List[str]
 
-class AccuracyImprovedVectorStore:
+class OptimalVectorStore:
     def __init__(self, embeddings):
         self.embeddings = embeddings
         self.documents = []
         self.vectors = []
     
-    def add_documents_improved(self, documents: List[Document]):
-        """Improved accuracy while maintaining speed"""
-        logger.info(f"ACCURACY+SPEED: Processing {len(documents)} chunks with 8 workers")
+    def add_documents_optimal(self, documents: List[Document]):
+        """Optimal processing for ≤30 pages within 30s"""
+        logger.info(f"OPTIMAL: Processing ALL {len(documents)} chunks (≤30 pages, 30s limit)")
         
         start_time = time.time()
         
-        def embed_with_smart_retry(doc):
-            """Smart retry - 2 attempts with different strategies"""
-            for attempt in range(2):
+        def embed_time_aware(doc):
+            """Time-aware embedding with smart retry"""
+            for attempt in range(2):  # 2 attempts to balance speed vs accuracy
                 try:
-                    if attempt == 0:
-                        # First attempt - normal
-                        return self.embeddings.embed_query(doc.page_content)
-                    else:
-                        # Second attempt - shorter delay
-                        time.sleep(0.15)
-                        return self.embeddings.embed_query(doc.page_content)
+                    if attempt > 0:
+                        time.sleep(0.1)  # Short delay for retry
+                    
+                    return self.embeddings.embed_query(doc.page_content)
+                    
                 except Exception as e:
-                    if attempt == 1:
-                        logger.warning(f"Embed failed after 2 attempts: {str(e)[:40]}")
+                    if attempt == 1:  # Final attempt
+                        logger.warning(f"Embed failed: {str(e)[:40]}")
                         return None
         
-        # 8 workers - balance between speed and stability
-        with ThreadPoolExecutor(max_workers=8) as executor:
-            vectors = list(executor.map(embed_with_smart_retry, documents))
+        # 10 workers - optimal for Together.AI speed vs stability
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            vectors = list(executor.map(embed_time_aware, documents))
         
         # Store results
         successful_count = 0
@@ -78,17 +76,21 @@ class AccuracyImprovedVectorStore:
         
         embedding_time = time.time() - start_time
         success_rate = (successful_count / len(documents)) * 100
-        logger.info(f"ACCURACY+SPEED: {embedding_time:.1f}s, {successful_count}/{len(documents)} chunks ({success_rate:.1f}% success)")
+        logger.info(f"OPTIMAL: {embedding_time:.1f}s, {successful_count}/{len(documents)} chunks ({success_rate:.1f}% success)")
+        
+        # Time warning if embedding takes too long
+        if embedding_time > 20:
+            logger.warning(f"Embedding took {embedding_time:.1f}s - may exceed 30s total")
     
-    def similarity_search(self, query: str, k: int = 8) -> List[Document]:
-        """Improved similarity search - back to cosine similarity"""
+    def similarity_search(self, query: str, k: int = 9) -> List[Document]:
+        """Optimal similarity search for 30-page docs"""
         if not self.vectors:
             return []
         
         try:
             query_vector = self.embeddings.embed_query(query)
             
-            # Back to proper cosine similarity for accuracy
+            # Efficient cosine similarity
             similarities = []
             query_norm = np.linalg.norm(query_vector)
             
@@ -100,7 +102,7 @@ class AccuracyImprovedVectorStore:
                 else:
                     similarities.append((0.0, i))
             
-            # Sort and return top k (increased from 6 to 8)
+            # Sort and return top k
             similarities.sort(reverse=True)
             top_indices = [idx for _, idx in similarities[:k]]
             
@@ -110,10 +112,11 @@ class AccuracyImprovedVectorStore:
             logger.error(f"Search error: {e}")
             return self.documents[:k] if len(self.documents) >= k else self.documents
 
-def improved_document_loader(url: str) -> List[Document]:
-    """Improved document loader - better page coverage"""
+def complete_30page_loader(url: str) -> List[Document]:
+    """Complete processing for ≤30 pages with time awareness"""
     try:
-        response = requests.get(url, timeout=12, headers={'User-Agent': 'Mozilla/5.0'})  # Restored timeout
+        load_start = time.time()
+        response = requests.get(url, timeout=12, headers={'User-Agent': 'Mozilla/5.0'})
         response.raise_for_status()
         
         url_lower = url.lower()
@@ -124,31 +127,40 @@ def improved_document_loader(url: str) -> List[Document]:
             pdf_reader = PyPDF2.PdfReader(pdf_file)
             total_pages = len(pdf_reader.pages)
             
-            # IMPROVED: Better page sampling for accuracy
-            if total_pages <= 25:
-                pages_to_process = list(range(total_pages))
-            else:
-                # More balanced sampling
-                first_pages = list(range(15))  # More from start (was 12)
-                middle_pages = list(range(total_pages//3, total_pages//3 + 8))  # More from middle (was 5)
-                last_pages = list(range(total_pages-10, total_pages))  # More from end (was 8)
-                pages_to_process = sorted(set(first_pages + middle_pages + last_pages))
+            if total_pages > 30:
+                logger.warning(f"Document has {total_pages} pages - expected ≤30. Processing first 30 pages.")
+                total_pages = 30  # Hard limit for time constraint
             
+            # COMPLETE PROCESSING - all pages for accuracy
             text = ""
-            for i in pages_to_process:
-                if i < len(pdf_reader.pages):
+            for i in range(total_pages):
+                try:
                     page_text = pdf_reader.pages[i].extract_text()
                     if page_text.strip():
-                        text += page_text + "\n\n"
+                        # Add page markers for better context
+                        text += f"\n=== PAGE {i+1} ===\n{page_text}\n"
+                except Exception as e:
+                    logger.warning(f"Error reading page {i+1}: {e}")
+                    continue
             
-            logger.info(f"IMPROVED: Processed {len(pages_to_process)}/{total_pages} pages")
-            return [Document(page_content=text.strip(), metadata={"source": url, "type": "pdf"})]
+            load_time = time.time() - load_start
+            logger.info(f"COMPLETE: Processed ALL {total_pages} pages in {load_time:.1f}s")
+            
+            return [Document(
+                page_content=text.strip(), 
+                metadata={"source": url, "type": "pdf", "pages": total_pages, "load_time": load_time}
+            )]
         
         elif url_lower.endswith('.docx') or 'wordprocessingml' in content_type:
             docx_file = io.BytesIO(response.content)
             doc = DocxDocument(docx_file)
             text = "\n".join([paragraph.text for paragraph in doc.paragraphs])
-            return [Document(page_content=text.strip(), metadata={"source": url, "type": "docx"})]
+            
+            load_time = time.time() - load_start
+            return [Document(
+                page_content=text.strip(), 
+                metadata={"source": url, "type": "docx", "load_time": load_time}
+            )]
         
         else:
             soup = BeautifulSoup(response.content, 'html.parser')
@@ -157,13 +169,18 @@ def improved_document_loader(url: str) -> List[Document]:
             text = soup.get_text()
             lines = (line.strip() for line in text.splitlines())
             text = '\n'.join(line for line in lines if line)
-            return [Document(page_content=text[:90000], metadata={"source": url, "type": "html"})]  # Increased limit
+            
+            load_time = time.time() - load_start
+            return [Document(
+                page_content=text[:150000],  # Reasonable limit for HTML
+                metadata={"source": url, "type": "html", "load_time": load_time}
+            )]
         
     except Exception as e:
         logger.error(f"Document load error: {e}")
         raise
 
-class AccuracyImprovedRAGEngine:
+class Optimal30PageRAGEngine:
     def __init__(self):
         self.chat_model = None
         self.embeddings = None
@@ -175,7 +192,7 @@ class AccuracyImprovedRAGEngine:
         if self.initialized:
             return
             
-        logger.info("Initializing ACCURACY IMPROVED RAG engine...")
+        logger.info("Initializing OPTIMAL RAG engine (≤30 pages, 30s limit)...")
         
         try:
             os.environ["TOGETHER_API_KEY"] = os.getenv("TOGETHER_API_KEY", "deb14836869b48e01e1853f49381b9eb7885e231ead3bc4f6bbb4a5fc4570b78")
@@ -185,55 +202,58 @@ class AccuracyImprovedRAGEngine:
             self.chat_model = ChatTogether(
                 model="meta-llama/Llama-3.3-70B-Instruct-Turbo-Free",
                 temperature=0,
-                max_tokens=3200  # Slightly increased for better answers
+                max_tokens=3500  # Balanced for speed vs detail
             )
 
-            # IMPROVED chunking - better balance
+            # OPTIMAL chunking for 30-page docs
             self.text_splitter = RecursiveCharacterTextSplitter(
-                chunk_size=1050,    # Increased from 1000
-                chunk_overlap=100,  # Increased from 80
-                separators=["\n\n", "\n", ". ", "! ", "? ", " "]  # Full separators back
+                chunk_size=900,   # Sweet spot: detail + speed
+                chunk_overlap=135, # 15% overlap for continuity
+                separators=["\n\n", "\n", ". ", "! ", "? ", "; ", " "]  # Good separation
             )
 
             self.initialized = True
-            logger.info("ACCURACY IMPROVED RAG engine ready!")
+            logger.info("OPTIMAL RAG engine ready!")
             
         except Exception as e:
             logger.error(f"Initialization error: {e}")
             raise
 
-    def _improved_query(self, vectorstore: AccuracyImprovedVectorStore, query: str) -> str:
-        """Improved query with better context"""
-        docs = vectorstore.similarity_search(query, k=8)  # More context docs
-        context = " ".join([doc.page_content for doc in docs])[:3000]  # More context chars
+    def _optimal_query(self, vectorstore: OptimalVectorStore, query: str) -> str:
+        """Optimal query balancing accuracy and speed"""
+        docs = vectorstore.similarity_search(query, k=9)  # Good context coverage
+        context = " ".join([doc.page_content for doc in docs])[:3500]  # Optimal context size
         
         from langchain_core.messages import HumanMessage, SystemMessage
         
-        # Better system prompt for accuracy
-        system_content = """You are an expert insurance policy analyst with high accuracy standards.
+        # Optimized system prompt for 30-page docs
+        system_content = """You are an expert insurance policy analyst specializing in comprehensive document analysis.
 
 CRITICAL INSTRUCTIONS:
 - Input questions are separated by " | "
-- Output answers MUST be separated by " | " in the same order
-- Provide accurate, detailed answers based on the document content
-- Include specific numbers, time periods, conditions, and percentages when available
+- Output answers MUST be separated by " | " in the exact same order
+- Provide accurate, detailed answers based on the complete document content
+- Include specific numbers, time periods, conditions, percentages, and exact requirements
+- Quote exact phrases when providing specific terms or conditions
 - If information is not in the document, state "Information not available in provided document"
-- Keep answers comprehensive but concise
+- Ensure each answer is comprehensive and addresses all aspects of the question
 
 QUALITY REQUIREMENTS:
-- Start with the key information first
-- Include specific details like amounts, time periods, percentages
-- Reference exact conditions and requirements from the document
-- Ensure each answer fully addresses its corresponding question
-- Use precise language from the source document
+- Start with the most important information first
+- Include specific details: amounts, time periods, percentages, conditions, exceptions
+- Reference exact conditions, prerequisites, and limitations from the document
+- Use precise terminology from the source document
+- For complex conditions, explain the requirements step-by-step
+- Include relevant cross-references when applicable
 
 CRITICAL: Separate each answer with " | " and maintain exact question order."""
 
-        human_content = f"""Answer these questions accurately based on the document:
+        human_content = f"""Based on the complete insurance policy document, provide comprehensive answers to these questions:
 
 Questions: {query}
 
-Document Context: {context}
+Complete Document Context:
+{context}
 
 Provide detailed, accurate answers separated by " | " in the same order."""
 
@@ -245,64 +265,72 @@ Provide detailed, accurate answers separated by " | " in the same order."""
         response = self.chat_model.invoke(messages)
         return response.content
 
-    async def process_improved(self, url: str, questions: List[str]) -> List[str]:
-        """Improved processing - better accuracy within time budget"""
+    async def process_optimal(self, url: str, questions: List[str]) -> List[str]:
+        """Optimal processing for ≤30 pages within 30s"""
         if not self.initialized:
             raise RuntimeError("RAG engine not initialized")
         
         try:
             return await asyncio.wait_for(
                 self._process_internal(url, questions),
-                timeout=30.0  # Keep 30s hard limit
+                timeout=30.0  # Hard 30s limit
             )
         except asyncio.TimeoutError:
             raise HTTPException(status_code=408, detail="30 second timeout exceeded")
 
     async def _process_internal(self, url: str, questions: List[str]) -> List[str]:
+        total_start = time.time()
         url_hash = hashlib.md5(url.encode()).hexdigest()[:8]
         
         if url_hash in self.vectorstore_cache:
             vectorstore = self.vectorstore_cache[url_hash]
-            logger.info("CACHED - INSTANT!")
+            logger.info("CACHED - INSTANT OPTIMAL!")
         else:
-            docs = improved_document_loader(url)
+            # Document loading phase
+            docs = complete_30page_loader(url)
             chunks = self.text_splitter.split_documents(docs)
             
-            # IMPROVED: More chunks for better accuracy
-            if len(chunks) > 65:  # Increased from 50 to 65
-                # Better chunk selection strategy
-                keep_first = int(len(chunks) * 0.5)   # 50% from start (was 60%)
-                keep_middle = int(len(chunks) * 0.15) # 15% from true middle
-                keep_last = int(len(chunks) * 0.25)   # 25% from end (was 40%)
-                
-                middle_start = len(chunks) // 2 - keep_middle // 2
-                chunks = (chunks[:keep_first] + 
-                         chunks[middle_start:middle_start + keep_middle] + 
-                         chunks[-keep_last:])
-                         
-                logger.info(f"IMPROVED: {len(chunks)} chunks selected (better coverage)")
+            # Check time budget
+            load_time = time.time() - total_start
+            if load_time > 8:
+                logger.warning(f"Document loading took {load_time:.1f}s - time budget tight")
             
-            vectorstore = AccuracyImprovedVectorStore(self.embeddings)
-            vectorstore.add_documents_improved(chunks)
+            # NO CHUNK LIMITING for ≤30 pages - process ALL for max accuracy
+            logger.info(f"OPTIMAL: Processing ALL {len(chunks)} chunks for maximum accuracy")
             
-            # Cache for future use
+            # Time-aware embedding
+            embed_start = time.time()
+            vectorstore = OptimalVectorStore(self.embeddings)
+            vectorstore.add_documents_optimal(chunks)
+            
+            embed_time = time.time() - embed_start
+            total_time_so_far = time.time() - total_start
+            
+            logger.info(f"Time budget: {total_time_so_far:.1f}s used, {30 - total_time_so_far:.1f}s remaining")
+            
+            # Cache the complete vectorstore
             self.vectorstore_cache[url_hash] = vectorstore
         
+        # Query phase
         batch_query = " | ".join(questions)
         
         query_start = time.time()
-        response = self._improved_query(vectorstore, batch_query)
+        response = self._optimal_query(vectorstore, batch_query)
         query_time = time.time() - query_start
         
-        logger.info(f"LLM: {query_time:.1f}s")
+        total_time = time.time() - total_start
+        logger.info(f"OPTIMAL: Query {query_time:.1f}s, Total {total_time:.1f}s")
         
-        # Improved answer parsing
+        # Enhanced answer parsing
         answers = []
         raw_splits = response.split(" | ")
         
         for split in raw_splits:
             cleaned = split.strip()
-            if cleaned and not cleaned.lower().startswith(('question:', 'answer:')):
+            # Filter out non-answers
+            if (cleaned and 
+                not cleaned.lower().startswith(('question:', 'answer:', 'based on', 'according to')) and
+                len(cleaned) > 10):  # Minimum substantive length
                 answers.append(cleaned)
         
         # Ensure correct count
@@ -312,7 +340,7 @@ Provide detailed, accurate answers separated by " | " in the same order."""
         return answers[:len(questions)]
 
 # Global engine
-rag_engine = AccuracyImprovedRAGEngine()
+rag_engine = Optimal30PageRAGEngine()
 
 def verify_token(authorization: Optional[str] = Header(None)):
     if authorization is None or not authorization.startswith("Bearer "):
@@ -326,21 +354,21 @@ def verify_token(authorization: Optional[str] = Header(None)):
 async def lifespan(app: FastAPI):
     try:
         rag_engine.initialize()
-        logger.info("ACCURACY IMPROVED RAG application ready")
+        logger.info("OPTIMAL 30-PAGE RAG application ready")
     except Exception as e:
         logger.error(f"Startup error: {e}")
     yield
 
-app = FastAPI(title="ACCURACY IMPROVED RAG API", version="3.0.0", lifespan=lifespan)
+app = FastAPI(title="OPTIMAL 30-PAGE RAG API", version="3.0.0", lifespan=lifespan)
 
 @app.post("/hackrx/run", response_model=AnswerResponse)
 async def ask_questions(
     request: QuestionRequest,
     authorization: str = Depends(verify_token)
 ):
-    """Improved accuracy while maintaining speed"""
+    """Optimal accuracy processing for documents ≤30 pages within 30s"""
     try:
-        logger.info(f"ACCURACY+SPEED: {len(request.questions)} questions - targeting 25-28s")
+        logger.info(f"OPTIMAL: {len(request.questions)} questions for ≤30 page document")
 
         if not request.documents.startswith(('http://', 'https://')):
             raise HTTPException(status_code=400, detail="Invalid document URL")
@@ -348,10 +376,10 @@ async def ask_questions(
             raise HTTPException(status_code=400, detail="No questions provided")
 
         start_time = time.time()
-        answers = await rag_engine.process_improved(request.documents, request.questions)
+        answers = await rag_engine.process_optimal(request.documents, request.questions)
         total_time = time.time() - start_time
 
-        logger.info(f"ACCURACY+SPEED: Completed in {total_time:.1f}s")
+        logger.info(f"OPTIMAL: Completed in {total_time:.1f}s with full document processing")
         return {"answers": answers}
 
     except HTTPException:
@@ -365,14 +393,16 @@ async def health_check():
     return {
         "status": "healthy",
         "cache_entries": len(rag_engine.vectorstore_cache),
-        "mode": "accuracy_improved",
-        "target_time": "25-28_seconds",
-        "embedding_provider": "Together.AI (Accuracy+Speed Mode)"
+        "mode": "optimal_30_pages",
+        "target_pages": "≤30_pages",
+        "time_limit": "30_seconds",
+        "processing": "complete_document",
+        "embedding_provider": "Together.AI (Optimal)"
     }
 
 @app.get("/")
 async def root():
-    return {"message": "ACCURACY IMPROVED RAG API - Better Balance"}
+    return {"message": "OPTIMAL RAG API - Max Accuracy for ≤30 Pages in ≤30 Seconds"}
 
 if __name__ == "__main__":
     import uvicorn
