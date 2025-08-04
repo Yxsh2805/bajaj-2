@@ -179,10 +179,12 @@ class BalancedRAGEngine:
         
         os.environ["TOGETHER_API_KEY"] = os.getenv("TOGETHER_API_KEY", "deb14836869b48e01e1853f49381b9eb7885e231ead3bc4f6bbb4a5fc4570b78")
         
-        self.embeddings = self.embeddings = OpenAIEmbeddings(
+        # Updated with your specified OpenAI API key
+        self.embeddings = OpenAIEmbeddings(
             model="text-embedding-3-small",
-            openai_api_key=os.getenv("OPENAI_API_KEY")
+            openai_api_key="sk-1234567890abcdef1234567890abcdef12345678"
         )
+        
         self.chat_model = ChatTogether(
             model="meta-llama/Llama-3.3-70B-Instruct-Turbo-Free",
             temperature=0,
@@ -367,4 +369,3 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
-
