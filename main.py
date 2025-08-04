@@ -17,13 +17,10 @@ import asyncio
 from fastapi import FastAPI, HTTPException, Header, Depends
 from pydantic import BaseModel
 
-# RAG imports
+# RAG imports - SIMPLIFIED to avoid init errors
 from langchain_together import ChatTogether, TogetherEmbeddings
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import StrOutputParser
-from langchain_core.runnables import RunnableAssign, RunnableLambda
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -48,21 +45,18 @@ class OptimizedSingleCallVectorStore:
         """Optimized embedding generation with controlled batching"""
         logger.info(f"Optimized processing {len(documents)} chunks for single LLM call")
         
-        # Process embeddings in controlled batches
         batch_size = 12  # Optimal batch size for Together.AI stability
         
         for i in range(0, len(documents), batch_size):
             batch = documents[i:i + batch_size]
             batch_start = time.time()
             
-            # Process batch with micro-delays for stability
             for j, doc in enumerate(batch):
                 try:
                     vector = self.embeddings.embed_query(doc.page_content)
                     self.documents.append(doc)
                     self.vectors.append(vector)
                     
-                    # Micro-delay to prevent rate limiting
                     if j < len(batch) - 1:
                         time.sleep(0.05)  # 50ms delay between calls
                         
@@ -76,7 +70,6 @@ class OptimizedSingleCallVectorStore:
             
             logger.info(f"Embedding batch {batch_num}/{total_batches} completed in {batch_time:.2f}s")
             
-            # Inter-batch delay for stability
             if batch_num < total_batches:
                 time.sleep(0.8)  # 800ms between batches
     
@@ -88,16 +81,13 @@ class OptimizedSingleCallVectorStore:
         try:
             query_vector = self.embeddings.embed_query(query)
             
-            # Efficient similarity calculation using numpy
             similarities = []
             for i, vector in enumerate(self.vectors):
-                # Compute cosine similarity efficiently
                 dot_product = np.dot(query_vector, vector)
                 norm_product = np.linalg.norm(query_vector) * np.linalg.norm(vector)
                 similarity = dot_product / norm_product if norm_product > 0 else 0
                 similarities.append((similarity, i))
             
-            # Get top k documents efficiently
             similarities.sort(key=lambda x: x[0], reverse=True)
             top_indices = [idx for _, idx in similarities[:k]]
             
@@ -116,17 +106,14 @@ def optimized_document_loader(url: str) -> List[Document]:
         url_lower = url.lower()
         content_type = response.headers.get('content-type', '').lower()
         
-        # Handle PDF with optimized processing
         if url_lower.endswith('.pdf') or 'pdf' in content_type:
             pdf_file = io.BytesIO(response.content)
             pdf_reader = PyPDF2.PdfReader(pdf_file)
             total_pages = len(pdf_reader.pages)
             
-            # Smart page processing for speed
             if total_pages <= 30:
                 pages_to_process = list(range(total_pages))
             else:
-                # Strategic sampling for large documents
                 first_pages = list(range(15))
                 middle_pages = list(range(total_pages//3, total_pages//3 + 10))
                 last_pages = list(range(total_pages-10, total_pages))
@@ -144,14 +131,12 @@ def optimized_document_loader(url: str) -> List[Document]:
             logger.info(f"Optimized processing: {len(pages_to_process)}/{total_pages} pages")
             return [Document(page_content=text.strip(), metadata={"source": url, "type": "pdf"})]
         
-        # Handle DOCX files
         elif url_lower.endswith('.docx') or 'wordprocessingml' in content_type:
             docx_file = io.BytesIO(response.content)
             doc = DocxDocument(docx_file)
             text = "\n".join([paragraph.text for paragraph in doc.paragraphs])
             return [Document(page_content=text.strip(), metadata={"source": url, "type": "docx"})]
         
-        # Handle EML files
         elif url_lower.endswith('.eml') or 'message/rfc822' in content_type:
             eml_content = response.content.decode('utf-8', errors='ignore')
             msg = email.message_from_string(eml_content)
@@ -164,8 +149,7 @@ def optimized_document_loader(url: str) -> List[Document]:
                 text = msg.get_payload(decode=True).decode('utf-8', errors='ignore')
             return [Document(page_content=text.strip(), metadata={"source": url, "type": "eml"})]
         
-        # Handle HTML files
-        else:
+        else:  # HTML
             soup = BeautifulSoup(response.content, 'html.parser')
             for script in soup(["script", "style", "nav", "footer", "header"]):
                 script.decompose()
@@ -184,7 +168,6 @@ class SingleCallRAGEngine:
         self.chat_model = None
         self.embeddings = None
         self.text_splitter = None
-        self.policy_prompt = None
         self.initialized = False
         self.document_cache: Dict[str, Any] = {}
         self.max_cache_size = 3
@@ -209,16 +192,29 @@ class SingleCallRAGEngine:
                 max_tokens=4000
             )
 
-            # Optimized chunking for single call
             self.text_splitter = RecursiveCharacterTextSplitter(
-                chunk_size=1000,  # Larger chunks for better context
+                chunk_size=1000,
                 chunk_overlap=100,
                 separators=["\n\n", "\n", ". ", "! ", "? ", " "]
             )
 
-            # Your PERFECT prompt template
-            self.policy_prompt = ChatPromptTemplate([
-                ("system", """You are a helpful assistant who is an expert in explaining insurance policies and their application to general queries.
+            self.initialized = True
+            logger.info("Single-call RAG engine initialized successfully")
+            
+        except Exception as e:
+            logger.error(f"Failed to initialize RAG engine: {str(e)}")
+            raise
+
+    def _single_call_query(self, vectorstore: OptimizedSingleCallVectorStore, query: str) -> str:
+        """SIMPLE: Single LLM call using direct message approach"""
+        try:
+            docs = vectorstore.similarity_search(query, k=6)
+            context = " ".join([doc.page_content for doc in docs])[:3500]
+            
+            # Use direct message approach - NO ChatPromptTemplate
+            from langchain_core.messages import HumanMessage, SystemMessage
+            
+            system_content = """You are a helpful assistant who is an expert in explaining insurance policies and their application to general queries.
 Help the human with their queries related to the context of the policy provided. If you don't feel you have a concrete answer, say so.
 Do not provide false information.
 
@@ -234,45 +230,24 @@ Guidelines:
 - Example bad: "if adherence to certain rules and meets certain conditions" (too vague/generic).
 - Example good: "if the insured is under the age of 60 and income is over 7lpa" (if supported by context!).
 - Replicate definitions in the language of the source document.
-- CRITICAL: Separate each answer with " | " and maintain the exact order of questions."""),
-                ("human", """Answer the following questions (separated by " | "):
+- CRITICAL: Separate each answer with " | " and maintain the exact order of questions."""
+
+            human_content = f"""Answer the following questions (separated by " | "):
 {query}
 
 Here are some relevant excerpts that might be useful for you in answering the questions:
-{context}"""),
-            ])
+{context}"""
 
-            self.initialized = True
-            logger.info("Single-call RAG engine initialized successfully")
+            messages = [
+                SystemMessage(content=system_content),
+                HumanMessage(content=human_content)
+            ]
             
-        except Exception as e:
-            logger.error(f"Failed to initialize RAG engine: {str(e)}")
-            raise
-
-    def _single_call_query(self, vectorstore: OptimizedSingleCallVectorStore, query: str) -> str:
-        """PERFECT: Single LLM call for all questions"""
-        try:
-            # Get relevant context documents
-            docs = vectorstore.similarity_search(query, k=6)
-            context = " ".join([doc.page_content for doc in docs])[:3500]
-            
-            # Build the chain for single LLM call
-            def get_context(x):
-                return context
-            
-            chain = (
-                RunnableAssign({"context": RunnableLambda(get_context)}) |
-                self.policy_prompt |
-                self.chat_model |
-                StrOutputParser()
-            )
-            
-            # SINGLE API CALL for ALL questions
             logger.info("Making SINGLE LLM API call for all questions...")
-            response = chain.invoke({"query": query})
+            response = self.chat_model.invoke(messages)
             logger.info("SINGLE LLM API call completed successfully")
             
-            return response
+            return response.content
             
         except Exception as e:
             logger.error(f"Single call query error: {e}")
@@ -294,7 +269,6 @@ Here are some relevant excerpts that might be useful for you in answering the qu
             load_time = time.time() - start_time
             logger.info(f"Document processed in {load_time:.2f}s ({len(chunks)} chunks)")
             
-            # Cache management
             if len(self.document_cache) >= self.max_cache_size:
                 oldest_key = next(iter(self.document_cache))
                 del self.document_cache[oldest_key]
@@ -329,13 +303,10 @@ Here are some relevant excerpts that might be useful for you in answering the qu
         if not self.initialized:
             raise RuntimeError("RAG engine not initialized")
         
-        total_start_time = time.time()
-        
         try:
-            # Process with timeout for Railway
             return await asyncio.wait_for(
                 self._process_questions_internal(url, questions),
-                timeout=28.0  # 28-second timeout for Railway
+                timeout=28.0
             )
         except asyncio.TimeoutError:
             logger.error("Single-call processing timeout")
@@ -343,13 +314,11 @@ Here are some relevant excerpts that might be useful for you in answering the qu
 
     async def _process_questions_internal(self, url: str, questions: List[str]) -> List[str]:
         """Internal processing logic"""
-        # Load and process document (optimized embedding generation)
         docs, chunks = self._load_and_process_document(url)
         vectorstore = self._create_vectorstore_optimized(url, chunks)
         
-        # SINGLE LLM CALL for ALL questions
         logger.info(f"Processing {len(questions)} questions in SINGLE LLM call...")
-        batch_query = " | ".join(questions)  # Your perfect approach
+        batch_query = " | ".join(questions)
         
         query_start_time = time.time()
         single_response = self._single_call_query(vectorstore, batch_query)
@@ -357,10 +326,8 @@ Here are some relevant excerpts that might be useful for you in answering the qu
         
         logger.info(f"SINGLE LLM call completed in {query_time:.2f}s")
         
-        # Parse single response into individual answers
         answers = [answer.strip() for answer in single_response.split(" | ")]
         
-        # Validate answer count
         if len(answers) != len(questions):
             logger.warning(f"Answer count mismatch: {len(questions)} questions, {len(answers)} answers")
             if len(answers) < len(questions):
