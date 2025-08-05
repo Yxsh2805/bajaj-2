@@ -170,7 +170,7 @@ class SpeedRAGEngine:
             self.embeddings = TogetherEmbeddings(model="BAAI/bge-base-en-v1.5")
             
             self.chat_model = ChatTogether(
-                model="meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo",
+                model="meta-llama/Llama-3.3-70B-Instruct-Turbo-Free",
                 temperature=0,
                 max_tokens=3000  # Reduced for speed
             )
@@ -327,5 +327,6 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
+
 
 
