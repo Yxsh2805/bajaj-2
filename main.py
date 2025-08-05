@@ -1,11 +1,16 @@
 # ==========================================================
-#  FINAL RAG – resilient + higher-accuracy   (≤30 s end-to-end)
+#  FINAL RAG – resilient + accurate (≤30 s end-to-end)
 # ==========================================================
-#  – Smart-retry & circuit-breaker (already present)
-#  – NEW: Multi-Query Expansion (MQE)
-#  – NEW: MMR de-dup/diversify re-rank
-#  – NEW: optional Cross-Encoder re-rank
-#  – Toggle accuracy knobs with three flags below
+#  • Smart-retry & circuit-breaker
+#  • Multi-Query Expansion (MQE)
+#  • MMR de-dup/diversify re-rank
+#  • Optional Cross-Encoder re-rank
+#
+#  Accuracy knobs (set at top):
+#  ─────────────────────────────
+#  USE_MQE = True   # +≈120 ms
+#  USE_MMR = True   # +≈2 ms
+#  USE_CE  = False  # +≈250 ms (turn on if budget allows)
 # ----------------------------------------------------------
 
 import os, time, logging, hashlib, random, io, asyncio
@@ -25,13 +30,13 @@ from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 # ----------------------- accuracy knobs --------------------
-USE_MQE = True   # Multi-Query Expansion (+≈120 ms)
-USE_MMR = True   # Max-Marginal-Relevance re-ranking (+≈2 ms)
-USE_CE  = False  # Cross-Encoder re-rank (+≈250 ms) – flip to True if you can spare it
+USE_MQE = True   # Multi-Query expansion
+USE_MMR = True   # Max-Marginal-Relevance
+USE_CE  = False  # Cross-encoder re-rank
 # -----------------------------------------------------------
 
 if USE_CE:
-    from sentence_transformers import CrossEncoder  # • pip install sentence-transformers
+    from sentence_transformers import CrossEncoder   # pip install sentence-transformers
 
 # ----------------------- logging ---------------------------
 logging.basicConfig(level=logging.INFO)
@@ -91,17 +96,17 @@ def with_smart_retry(max_retries=2, base_delay=0.3):
 # ===========================================================
 
 
-# ================= vector store (unchanged speed) ==========
+# ================= vector store (fast + robust) ============
 class FinalOptimizedVectorStore:
     def __init__(self, embeddings):
         self.embeddings, self.documents, self.vectors = embeddings, [], []
         self.circuit = CircuitBreaker(4, 10)
 
     @with_smart_retry(2, 0.2)
-    def _embed(self, text):       # wrapper adds retries
+    def _embed(self, text):
         return self.embeddings.embed_query(text)
 
-    def _embed_doc(self, doc):
+    def _embed_doc(self, doc: Document):
         try:
             return self.circuit.call(self._embed, doc.page_content)
         except Exception:
@@ -115,22 +120,18 @@ class FinalOptimizedVectorStore:
         ok = self._store(docs, vecs)
         logger.info(f"FINAL: {time.time()-t0:.1f}s, {ok} chunks embedded")
 
-    # ---------- public search -----------
     def similarity_search(self, query: str, k: int = 7):
         if not self.vectors:
             return []
         qvec = self.circuit.call(self._embed, query)
         if qvec is None:
             return self.documents[:k]
-        sims = []
-        qnorm = np.linalg.norm(qvec)
+        sims, qn = [], np.linalg.norm(qvec)
         for i, v in enumerate(self.vectors):
-            denom = (qnorm * np.linalg.norm(v) + 1e-9)
-            sims.append((np.dot(qvec, v) / denom, i))
+            sims.append((np.dot(qvec, v) / (qn * np.linalg.norm(v) + 1e-9), i))
         sims.sort(reverse=True)
         return [self.documents[i] for _, i in sims[:k]]
 
-    # ---------- helpers -----------
     def _store(self, docs, vecs):
         cnt = 0
         for d, v in zip(docs, vecs):
@@ -154,27 +155,24 @@ def final_document_loader(url: str) -> List[Document]:
         if url_l.endswith(".pdf") or "pdf" in ctype:
             pdf = PyPDF2.PdfReader(io.BytesIO(r.content))
             pages = min(len(pdf.pages), 20)
-            if pages <= 10:
-                pick = range(pages)
-            else:
-                pick = sorted(set(range(5) +
-                                  list(range(pages//2-1, pages//2+2)) +
-                                  list(range(pages-5, pages))))
-            text = ""
+            pick = list(range(pages)) if pages <= 10 else \
+                   sorted(set(range(5) +
+                              list(range(pages//2-1, pages//2+2)) +
+                              list(range(pages-5, pages))))
+            txt = ""
             for i in pick:
-                tx = pdf.pages[i].extract_text() or ""
-                text += tx + "\n\n"
-            return [Document(page_content=text[:80000],
+                txt += (pdf.pages[i].extract_text() or "") + "\n\n"
+            return [Document(page_content=txt[:80000],
                              metadata={"source": url, "type": "pdf"})]
 
         # -------- HTML/others --------
         soup = BeautifulSoup(r.content, "html.parser")
         for tag in soup(["script", "style", "nav", "footer", "header"]):
             tag.decompose()
-        text = "\n".join(line.strip() for line in soup.get_text().splitlines()
-                         if line.strip())
+        text = "\n".join(l.strip() for l in soup.get_text().splitlines() if l.strip())
         return [Document(page_content=text[:80000],
                          metadata={"source": url, "type": "html"})]
+
     except Exception as e:
         logger.error(f"Document load error: {e}")
         raise
@@ -215,7 +213,7 @@ class FinalRAGEngine:
 
     # ---------- accuracy helpers ----------
     @with_smart_retry(2, 0.2)
-    def _embed(self, text):                    # local retry embed
+    def _embed(self, text):
         return self.emb.embed_query(text)
 
     def _expand_queries(self, q: str, n: int = 2) -> List[str]:
@@ -231,33 +229,29 @@ class FinalRAGEngine:
             logger.warning(f"MQE failed: {e}")
             return [q]
 
-    def _mmr(self, qvec, doc_vecs, docs,
-             lam: float = 0.6, top_k: int = 6):
+    def _mmr(self, qvec, doc_vecs, docs, lam: float = 0.6, top_k: int = 6):
         if not USE_MMR or len(docs) <= top_k:
             return docs[:top_k]
-        sim_qd = doc_vecs @ qvec / (
-            np.linalg.norm(doc_vecs, axis=1) * np.linalg.norm(qvec) + 1e-9)
-        selected, cand = [], list(range(len(docs)))
-        while len(selected) < top_k and cand:
-            if not selected:
+        sim_qd = doc_vecs @ qvec / \
+                 (np.linalg.norm(doc_vecs, axis=1) * np.linalg.norm(qvec) + 1e-9)
+        sel, cand = [], list(range(len(docs)))
+        while len(sel) < top_k and cand:
+            if not sel:
                 idx = cand[int(np.argmax(sim_qd[cand]))]
             else:
-                sim_dd = doc_vecs[cand] @ doc_vecs[selected].T
-                max_dd = sim_dd.max(axis=1)
-                mmr = lam * sim_qd[cand] - (1 - lam) * max_dd
+                sim_dd = doc_vecs[cand] @ doc_vecs[sel].T
+                mmr = lam * sim_qd[cand] - (1-lam) * sim_dd.max(axis=1)
                 idx = cand[int(np.argmax(mmr))]
-            selected.append(idx)
+            sel.append(idx)
             cand.remove(idx)
-        return [docs[i] for i in selected]
+        return [docs[i] for i in sel]
 
     def _ce_rerank(self, q: str, docs: List[Document], top_k: int = 5):
         if not USE_CE:
             return docs[:top_k]
         pairs = [[q, d.page_content[:350]] for d in docs]
         scores = self.ce.predict(pairs)
-        ranked = [d for _, d in
-                  sorted(zip(scores, docs), reverse=True)]
-        return ranked[:top_k]
+        return [d for _, d in sorted(zip(scores, docs), reverse=True)][:top_k]
 
     # ---------- core query ----------
     @with_smart_retry(1, 0.2)
@@ -266,40 +260,34 @@ class FinalRAGEngine:
 
     def _final_query(self, vs: FinalOptimizedVectorStore, q: str) -> str:
         # -------- retrieval pipeline --------
-        alt_qs = self._expand_queries(q)
         cand_docs = []
-        for aq in alt_qs:
+        for aq in self._expand_queries(q):
             for d in vs.similarity_search(aq, k=4):
                 if d.page_content not in {c.page_content for c in cand_docs}:
                     cand_docs.append(d)
 
-        # MMR re-rank
         if USE_MMR and len(cand_docs) > 6:
             qvec = self._embed(q)
-            dvecs = np.vstack([self._embed(d.page_content[:512])
-                               for d in cand_docs])
+            dvecs = np.vstack([self._embed(d.page_content[:512]) for d in cand_docs])
             cand_docs = self._mmr(qvec, dvecs, cand_docs, top_k=6)
 
-        # Cross-encoder re-rank
         cand_docs = self._ce_rerank(q, cand_docs, top_k=5)
 
         ctx = " ".join(d.page_content for d in cand_docs)[:2_200]
 
         from langchain_core.messages import HumanMessage, SystemMessage
-        sys_prompt = """
-You are an insurance policy expert. Answer the questions below.
-RULES:
-- Questions are separated by " | ".
-- Provide ONLY answers separated by " | " in the same order.
-- Do NOT repeat the questions.
-- If info missing, say "Information not available in document".
-""".strip()
-
-        human = (f"Document Context: {ctx}\n\n"
-                 f"Questions to answer: {q}\n\n"
-                 f"Provide ONLY the answers separated by ' | ':")
-        msgs = [SystemMessage(content=sys_prompt),
-                HumanMessage(content=human)]
+        sys_msg = (
+            "You are an insurance policy expert.\n"
+            "- Questions are separated by ' | '.\n"
+            "- Provide ONLY answers separated by ' | ' in the same order.\n"
+            "- If info missing, output 'Information not available in document'."
+        )
+        human = (
+            f"Document Context: {ctx}\n\n"
+            f"Questions to answer: {q}\n\n"
+            f"Provide ONLY the answers separated by ' | ':"
+        )
+        msgs = [SystemMessage(content=sys_msg), HumanMessage(content=human)]
 
         try:
             resp = self.circuit.call(self._invoke_llm, msgs)
@@ -307,8 +295,7 @@ RULES:
                 return "Service temporarily unavailable | " * q.count("|") + \
                        "Service temporarily unavailable"
             return resp.content
-        except Exception as e:
-            logger.error(f"LLM query error: {e}")
+        except Exception:
             return "Information not available due to service error"
 
     # ---------- public wrapper ----------
@@ -328,9 +315,7 @@ RULES:
                     s, m = int(30*0.4), int(30*0.25)
                     e = 30 - s - m
                     mid = len(chunks)//2 - m//2
-                    chunks = (chunks[:s] +
-                              chunks[mid:mid+m] +
-                              chunks[-e:])
+                    chunks = (chunks[:s] + chunks[mid:mid+m] + chunks[-e:])
                 vs = FinalOptimizedVectorStore(self.emb)
                 vs.add_documents_final(chunks)
                 if len(vs.documents) >= max(10, len(chunks)//2):
@@ -366,9 +351,9 @@ async def lifespan(app: FastAPI):
     rag.initialize()
     yield
 
-api = FastAPI(title="FINAL RAG API", lifespan=lifespan)
+app = FastAPI(title="FINAL RAG API", lifespan=lifespan)  # ← FastAPI instance is now 'app'
 
-@api.post("/hackrx/run", response_model=AnswerResponse)
+@app.post("/hackrx/run", response_model=AnswerResponse)
 async def ask(request: QuestionRequest, _: str = Depends(verify_token)):
     if not request.documents.startswith(("http://", "https://")):
         raise HTTPException(status_code=400, detail="Invalid URL")
@@ -379,7 +364,7 @@ async def ask(request: QuestionRequest, _: str = Depends(verify_token)):
     logger.info(f"Total {time.time()-t0:.1f}s")
     return {"answers": answers}
 
-@api.get("/health")
+@app.get("/health")
 async def health():
     return {
         "status": "ready",
@@ -389,10 +374,10 @@ async def health():
                      "circuit_breaker", "smart_retry"]
     }
 
-@api.get("/")
+@app.get("/")
 async def root():
     return {"message": "FINAL RAG API – resilient & accurate"}
 
 if __name__ == "__main__":
-    import uvicorn, sys
-    uvicorn.run(api, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
