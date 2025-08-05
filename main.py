@@ -36,44 +36,62 @@ class QuestionRequest(BaseModel):
 class AnswerResponse(BaseModel):
     answers: List[str]
 
-class Optimized65VectorStore:
+class BatchOptimizedVectorStore:
     def __init__(self, embeddings):
         self.embeddings = embeddings
         self.documents = []
         self.vectors = []
     
-    def add_documents_fast_65(self, documents: List[Document]):
-        """Fast processing of up to 65 chunks for optimal coverage"""
-        logger.info(f"FAST 65: Processing {len(documents)} chunks (target <30s)")
+    def add_documents_batch_optimized(self, documents: List[Document]):
+        """BATCH embedding optimization - much faster"""
+        logger.info(f"BATCH: Processing {len(documents)} chunks in batches")
         
         start_time = time.time()
         
-        def embed_reliable(doc):
-            """Single-attempt reliable embedding"""
-            try:
-                return self.embeddings.embed_query(doc.page_content)
-            except Exception as e:
-                logger.warning(f"Embed failed: {str(e)[:30]}")
-                return None
+        # Extract all texts for batch processing
+        texts = [doc.page_content for doc in documents]
         
-        # 6 workers for stability and speed balance
-        with ThreadPoolExecutor(max_workers=6) as executor:
-            vectors = list(executor.map(embed_reliable, documents))
-        
-        # Store successful results
+        try:
+            # BATCH EMBEDDING - single API call for all chunks
+            logger.info("BATCH: Making single API call for all embeddings...")
+            vectors = self.embeddings.embed_documents(texts)  # Batch call
+            
+            # Store all results
+            for doc, vector in zip(documents, vectors):
+                self.documents.append(doc)
+                self.vectors.append(vector)
+            
+            embedding_time = time.time() - start_time
+            logger.info(f"BATCH: {embedding_time:.1f}s for {len(documents)} chunks (MUCH FASTER!)")
+            
+        except Exception as e:
+            logger.error(f"Batch embedding failed: {e}")
+            # Fallback to individual processing if batch fails
+            logger.info("Falling back to individual embedding...")
+            self._fallback_individual_embedding(documents)
+    
+    def _fallback_individual_embedding(self, documents: List[Document]):
+        """Fallback individual embedding with rate limiting"""
         successful_count = 0
-        for doc, vector in zip(documents, vectors):
-            if vector is not None:
+        
+        for i, doc in enumerate(documents):
+            try:
+                if i > 0 and i % 10 == 0:  # Rate limiting
+                    time.sleep(0.5)
+                
+                vector = self.embeddings.embed_query(doc.page_content)
                 self.documents.append(doc)
                 self.vectors.append(vector)
                 successful_count += 1
+                
+            except Exception as e:
+                logger.warning(f"Failed to embed chunk {i}: {str(e)[:30]}")
+                continue
         
-        embedding_time = time.time() - start_time
-        success_rate = (successful_count / len(documents)) * 100
-        logger.info(f"FAST 65: {embedding_time:.1f}s, {successful_count}/{len(documents)} chunks ({success_rate:.1f}% success)")
+        logger.info(f"FALLBACK: {successful_count}/{len(documents)} chunks embedded")
     
     def similarity_search(self, query: str, k: int = 7) -> List[Document]:
-        """Fast similarity search optimized for 65 chunks"""
+        """Fast similarity search"""
         if not self.vectors:
             return []
         
@@ -102,10 +120,11 @@ class Optimized65VectorStore:
             logger.error(f"Search error: {e}")
             return self.documents[:k] if len(self.documents) >= k else self.documents
 
-def fast_document_loader(url: str) -> List[Document]:
-    """Optimized document loader for 25-page limit"""
+def fast_document_loader_with_logging(url: str) -> List[Document]:
+    """Document loader with detailed logging"""
     try:
-        response = requests.get(url, timeout=8, headers={'User-Agent': 'Mozilla/5.0'})
+        logger.info(f"DOCUMENT: Loading from {url}")
+        response = requests.get(url, timeout=10, headers={'User-Agent': 'Mozilla/5.0'})
         response.raise_for_status()
         
         url_lower = url.lower()
@@ -114,9 +133,9 @@ def fast_document_loader(url: str) -> List[Document]:
         if url_lower.endswith('.pdf') or 'pdf' in content_type:
             pdf_file = io.BytesIO(response.content)
             pdf_reader = PyPDF2.PdfReader(pdf_file)
-            total_pages = min(len(pdf_reader.pages), 25)  # Hard limit 25 pages
+            total_pages = min(len(pdf_reader.pages), 25)
             
-            # Fast batch processing
+            # Process all pages
             text_parts = []
             for i in range(total_pages):
                 try:
@@ -127,14 +146,30 @@ def fast_document_loader(url: str) -> List[Document]:
                     logger.warning(f"Error reading page {i+1}: {e}")
                     continue
             
-            text = "\n\n".join(text_parts)
-            logger.info(f"FAST: Processed {total_pages} pages ({len(text)} chars)")
-            return [Document(page_content=text[:120000], metadata={"source": url, "type": "pdf", "pages": total_pages})]
+            full_text = "\n\n".join(text_parts)
+            char_count = len(full_text)
+            logger.info(f"DOCUMENT: PDF - {total_pages} pages, {char_count:,} characters")
+            
+            # Log document preview
+            preview = full_text[:500].replace('\n', ' ')
+            logger.info(f"DOCUMENT PREVIEW: {preview}...")
+            
+            return [Document(page_content=full_text[:120000], metadata={
+                "source": url, 
+                "type": "pdf", 
+                "pages": total_pages,
+                "char_count": char_count
+            })]
         
         elif url_lower.endswith('.docx') or 'wordprocessingml' in content_type:
             docx_file = io.BytesIO(response.content)
             doc = DocxDocument(docx_file)
             text = "\n".join([paragraph.text for paragraph in doc.paragraphs])
+            
+            logger.info(f"DOCUMENT: DOCX - {len(text):,} characters")
+            preview = text[:500].replace('\n', ' ')
+            logger.info(f"DOCUMENT PREVIEW: {preview}...")
+            
             return [Document(page_content=text[:120000], metadata={"source": url, "type": "docx"})]
         
         else:
@@ -143,14 +178,19 @@ def fast_document_loader(url: str) -> List[Document]:
                 script.decompose()
             text = soup.get_text()
             lines = (line.strip() for line in text.splitlines())
-            text = '\n'.join(line for line in lines if line)
-            return [Document(page_content=text[:120000], metadata={"source": url, "type": "html"})]
+            clean_text = '\n'.join(line for line in lines if line)
+            
+            logger.info(f"DOCUMENT: HTML - {len(clean_text):,} characters")
+            preview = clean_text[:500].replace('\n', ' ')
+            logger.info(f"DOCUMENT PREVIEW: {preview}...")
+            
+            return [Document(page_content=clean_text[:120000], metadata={"source": url, "type": "html"})]
         
     except Exception as e:
         logger.error(f"Document load error: {e}")
         raise
 
-class Fast65RAGEngine:
+class BatchOptimizedRAGEngine:
     def __init__(self):
         self.chat_model = None
         self.embeddings = None
@@ -162,43 +202,43 @@ class Fast65RAGEngine:
         if self.initialized:
             return
             
-        logger.info("Initializing FAST 65-CHUNK RAG engine with 8B model...")
+        logger.info("Initializing BATCH-OPTIMIZED RAG engine...")
         
         try:
             os.environ["TOGETHER_API_KEY"] = os.getenv("TOGETHER_API_KEY", "deb14836869b48e01e1853f49381b9eb7885e231ead3bc4f6bbb4a5fc4570b78")
             
             self.embeddings = TogetherEmbeddings(model="BAAI/bge-base-en-v1.5")
             
-            # CRITICAL: Switch to 8B model for speed
+            # 8B model for speed
             self.chat_model = ChatTogether(
-                model="meta-llama/Llama-3.1-8B-Instruct-Turbo",  # 8B instead of 70B
+                model="meta-llama/Llama-3.1-8B-Instruct-Turbo",
                 temperature=0,
-                max_tokens=2000  # Reduced for speed
+                max_tokens=2000
             )
 
-            # Optimized chunking for 65 chunks
+            # Optimized chunking
             self.text_splitter = RecursiveCharacterTextSplitter(
-                chunk_size=1800,    # Balanced size
-                chunk_overlap=150,  # Reasonable overlap
-                separators=["\n\n", "\n", ". ", " "]  # Efficient separators
+                chunk_size=1800,
+                chunk_overlap=150,
+                separators=["\n\n", "\n", ". ", " "]
             )
 
             self.initialized = True
-            logger.info("FAST 65-CHUNK RAG engine ready with 8B model!")
+            logger.info("BATCH-OPTIMIZED RAG engine ready!")
             
         except Exception as e:
             logger.error(f"Initialization error: {e}")
             raise
 
-    def smart_chunk_selection(self, chunks: List[Document], target_chunks: int = 65) -> List[Document]:
-        """Smart adaptive selection for optimal 65-chunk coverage"""
+    def smart_chunk_selection(self, chunks: List[Document], target_chunks: int = 50) -> List[Document]:
+        """Reduced to 50 chunks for faster batch embedding"""
         total = len(chunks)
         
         if total <= target_chunks:
             logger.info(f"COVERAGE: Using all {total} chunks")
             return chunks
         
-        if total <= 100:
+        if total <= 80:
             # Dense sampling for smaller documents
             step = total / target_chunks
             indices = [int(i * step) for i in range(target_chunks)]
@@ -207,9 +247,9 @@ class Fast65RAGEngine:
             return selected
         else:
             # Strategic sampling for larger documents
-            start_count = int(target_chunks * 0.38)  # 25 chunks from start
-            middle_count = int(target_chunks * 0.24)  # 15 chunks from middle
-            end_count = target_chunks - start_count - middle_count  # 25 chunks from end
+            start_count = int(target_chunks * 0.40)  # 20 chunks
+            middle_count = int(target_chunks * 0.25)  # 12-13 chunks  
+            end_count = target_chunks - start_count - middle_count  # 17-18 chunks
             
             middle_start = total // 2 - middle_count // 2
             
@@ -221,14 +261,13 @@ class Fast65RAGEngine:
             logger.info(f"Distribution: Start={start_count}, Middle={middle_count}, End={end_count}")
             return selected[:target_chunks]
 
-    def _fast_65_query(self, vectorstore: Optimized65VectorStore, query: str) -> str:
-        """Streamlined query optimized for 8B model"""
-        docs = vectorstore.similarity_search(query, k=7)  # Good coverage from 65 chunks
-        context = " ".join([doc.page_content for doc in docs])[:2400]  # Optimized context length
+    def _batch_optimized_query(self, vectorstore: BatchOptimizedVectorStore, query: str) -> str:
+        """Optimized query for batch processing"""
+        docs = vectorstore.similarity_search(query, k=7)
+        context = " ".join([doc.page_content for doc in docs])[:2400]
         
         from langchain_core.messages import HumanMessage, SystemMessage
         
-        # Streamlined system prompt for 8B model
         system_content = """Insurance expert. Extract specific facts from document.
 
 RULES:
@@ -252,15 +291,15 @@ Provide answers separated by " | " in exact order:"""
         response = self.chat_model.invoke(messages)
         return response.content
 
-    async def process_fast_65(self, url: str, questions: List[str]) -> List[str]:
-        """Fast 65-chunk processing under 30 seconds"""
+    async def process_batch_optimized(self, url: str, questions: List[str]) -> List[str]:
+        """Batch-optimized processing"""
         if not self.initialized:
             raise RuntimeError("RAG engine not initialized")
         
         try:
             return await asyncio.wait_for(
                 self._process_internal(url, questions),
-                timeout=29.0  # Slightly under 30s for safety
+                timeout=29.0
             )
         except asyncio.TimeoutError:
             raise HTTPException(status_code=408, detail="29 second timeout exceeded")
@@ -273,46 +312,45 @@ Provide answers separated by " | " in exact order:"""
             vectorstore = self.vectorstore_cache[url_hash]
             logger.info("CACHED - INSTANT!")
         else:
-            # Fast document loading
+            # Document loading with logging
             load_start = time.time()
-            docs = fast_document_loader(url)
+            docs = fast_document_loader_with_logging(url)
             chunks = self.text_splitter.split_documents(docs)
             load_time = time.time() - load_start
             
-            # Smart chunk selection for optimal coverage
+            # Smart chunk selection (reduced to 50 for batch speed)
             select_start = time.time()
-            selected_chunks = self.smart_chunk_selection(chunks, target_chunks=65)
+            selected_chunks = self.smart_chunk_selection(chunks, target_chunks=50)
             select_time = time.time() - select_start
             
             logger.info(f"TIMING: Load={load_time:.1f}s, Select={select_time:.1f}s")
             
-            # Fast embedding
+            # BATCH embedding (single API call)
             embed_start = time.time()
-            vectorstore = Optimized65VectorStore(self.embeddings)
-            vectorstore.add_documents_fast_65(selected_chunks)
+            vectorstore = BatchOptimizedVectorStore(self.embeddings)
+            vectorstore.add_documents_batch_optimized(selected_chunks)
             embed_time = time.time() - embed_start
             
             # Cache for future use
             self.vectorstore_cache[url_hash] = vectorstore
             logger.info(f"TIMING: Embed={embed_time:.1f}s")
         
-        # Fast query processing
+        # Query processing
         batch_query = " | ".join(questions)
         
         query_start = time.time()
-        response = self._fast_65_query(vectorstore, batch_query)
+        response = self._batch_optimized_query(vectorstore, batch_query)
         query_time = time.time() - query_start
         
         total_time = time.time() - total_start
-        logger.info(f"FAST 65: Query={query_time:.1f}s, Total={total_time:.1f}s")
+        logger.info(f"BATCH: Query={query_time:.1f}s, Total={total_time:.1f}s")
         
-        # Quick answer parsing
+        # Answer parsing
         answers = []
         raw_splits = response.split(" | ")
         
         for split in raw_splits:
             cleaned = split.strip()
-            # Filter out obvious non-answers
             if (cleaned and len(cleaned) > 5 and 
                 not cleaned.lower().startswith(('question:', 'answer:', 'q:', 'a:'))):
                 answers.append(cleaned)
@@ -325,7 +363,7 @@ Provide answers separated by " | " in exact order:"""
         return answers[:len(questions)]
 
 # Global engine
-rag_engine = Fast65RAGEngine()
+rag_engine = BatchOptimizedRAGEngine()
 
 def verify_token(authorization: Optional[str] = Header(None)):
     if authorization is None or not authorization.startswith("Bearer "):
@@ -339,21 +377,21 @@ def verify_token(authorization: Optional[str] = Header(None)):
 async def lifespan(app: FastAPI):
     try:
         rag_engine.initialize()
-        logger.info("FAST 65-CHUNK RAG application ready")
+        logger.info("BATCH-OPTIMIZED RAG application ready")
     except Exception as e:
         logger.error(f"Startup error: {e}")
     yield
 
-app = FastAPI(title="FAST 65-CHUNK RAG API", version="4.0.0", lifespan=lifespan)
+app = FastAPI(title="BATCH-OPTIMIZED RAG API", version="5.0.0", lifespan=lifespan)
 
 @app.post("/hackrx/run", response_model=AnswerResponse)
 async def ask_questions(
     request: QuestionRequest,
     authorization: str = Depends(verify_token)
 ):
-    """Fast 65-chunk processing with 8B model - guaranteed under 30 seconds"""
+    """Batch-optimized processing - single API call for embeddings"""
     try:
-        logger.info(f"FAST 65: {len(request.questions)} questions (65 chunk limit, 8B model)")
+        logger.info(f"BATCH: {len(request.questions)} questions (50 chunks, batch embedding)")
 
         if not request.documents.startswith(('http://', 'https://')):
             raise HTTPException(status_code=400, detail="Invalid document URL")
@@ -361,10 +399,10 @@ async def ask_questions(
             raise HTTPException(status_code=400, detail="No questions provided")
 
         start_time = time.time()
-        answers = await rag_engine.process_fast_65(request.documents, request.questions)
+        answers = await rag_engine.process_batch_optimized(request.documents, request.questions)
         total_time = time.time() - start_time
 
-        logger.info(f"FAST 65: Completed in {total_time:.1f}s")
+        logger.info(f"BATCH: Completed in {total_time:.1f}s")
         return {"answers": answers}
 
     except HTTPException:
@@ -378,17 +416,16 @@ async def health_check():
     return {
         "status": "healthy",
         "cache_entries": len(rag_engine.vectorstore_cache),
-        "mode": "fast_65_chunks",
-        "max_chunks": 65,
+        "mode": "batch_optimized",
+        "max_chunks": 50,
         "model": "Llama-3.1-8B-Instruct-Turbo",
-        "chunk_distribution": "38% start, 24% middle, 38% end",
-        "target_time": "<30_seconds",
-        "embedding_provider": "Together.AI (Fast 65)"
+        "embedding_strategy": "batch_single_api_call",
+        "target_time": "<20_seconds"
     }
 
 @app.get("/")
 async def root():
-    return {"message": "FAST 65-CHUNK RAG API - Optimal Coverage Under 30 Seconds"}
+    return {"message": "BATCH-OPTIMIZED RAG API - Single API Call for All Embeddings"}
 
 if __name__ == "__main__":
     import uvicorn
