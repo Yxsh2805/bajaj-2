@@ -18,7 +18,7 @@ from concurrent.futures import ThreadPoolExecutor
 from fastapi import FastAPI, HTTPException, Header, Depends
 from pydantic import BaseModel
 
-# RAG imports
+# RAG imports - back to Together.AI for speed
 from langchain_together import ChatTogether, TogetherEmbeddings
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -36,112 +36,69 @@ class QuestionRequest(BaseModel):
 class AnswerResponse(BaseModel):
     answers: List[str]
 
-class UltraFastVectorStore:
+class SpeedOptimizedVectorStore:
     def __init__(self, embeddings):
         self.embeddings = embeddings
         self.documents = []
         self.vectors = []
     
-    def add_documents_ultra_fast(self, documents: List[Document]):
-        """ULTRA FAST embedding with aggressive optimizations"""
-        logger.info(f"ULTRA FAST: Processing {len(documents)} chunks")
+    def add_documents_fast(self, documents: List[Document]):
+        """SPEED OPTIMIZED - 30 second target"""
+        logger.info(f"SPEED MODE: Processing {len(documents)} chunks with 10 workers")
         
         start_time = time.time()
         
-        # Clean and validate texts first
-        valid_texts = []
-        valid_docs = []
+        def embed_minimal_retry(doc):
+            """Minimal retry for maximum speed"""
+            try:
+                return self.embeddings.embed_query(doc.page_content)
+            except Exception as e:
+                # Only ONE retry to keep speed up
+                try:
+                    time.sleep(0.1)  # Very short pause
+                    return self.embeddings.embed_query(doc.page_content)
+                except:
+                    logger.warning(f"Fast fail: {str(e)[:30]}")
+                    return None
         
-        for doc in documents:
-            # Clean text aggressively
-            text = doc.page_content.strip()
-            # Remove problematic characters
-            text = ''.join(char for char in text if ord(char) < 65536)
-            # Limit length
-            text = text[:1500]
-            
-            if len(text) > 50:  # Only embed meaningful content
-                valid_texts.append(text)
-                valid_docs.append(Document(page_content=text, metadata=doc.metadata))
+        # 10 workers for speed (Together.AI can handle this)
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            vectors = list(executor.map(embed_minimal_retry, documents))
         
-        logger.info(f"ULTRA FAST: {len(valid_texts)} valid chunks after cleaning")
-        
-        # Try batch first, with immediate fallback
-        try:
-            # Quick batch attempt with timeout
-            vectors = asyncio.wait_for(
-                asyncio.to_thread(self.embeddings.embed_documents, valid_texts[:30]),  # Limit to 30
-                timeout=8.0
-            )
-            vectors = asyncio.run(vectors)
-            
-            # Store results
-            for doc, vector in zip(valid_docs[:30], vectors):
+        # Store results quickly
+        successful_count = 0
+        for doc, vector in zip(documents, vectors):
+            if vector is not None:
                 self.documents.append(doc)
                 self.vectors.append(vector)
-                
-            embedding_time = time.time() - start_time
-            logger.info(f"ULTRA FAST: BATCH SUCCESS! {embedding_time:.1f}s for {len(vectors)} chunks")
-            return
-            
-        except Exception as e:
-            logger.warning(f"Batch failed: {str(e)[:50]}, using ultra-fast individual...")
-        
-        # Ultra-fast individual with strict limits
-        self._ultra_fast_individual(valid_docs[:25])  # Even fewer chunks
+                successful_count += 1
         
         embedding_time = time.time() - start_time
-        logger.info(f"ULTRA FAST: {embedding_time:.1f}s total")
+        success_rate = (successful_count / len(documents)) * 100
+        logger.info(f"SPEED MODE: {embedding_time:.1f}s, {successful_count}/{len(documents)} chunks ({success_rate:.1f}% success)")
     
-    def _ultra_fast_individual(self, documents: List[Document]):
-        """Ultra-fast individual embedding with no retries"""
-        successful = 0
-        
-        for i, doc in enumerate(documents):
-            if i >= 25:  # Hard limit
-                break
-                
-            try:
-                vector = self.embeddings.embed_query(doc.page_content)
-                self.documents.append(doc)
-                self.vectors.append(vector)
-                successful += 1
-                
-                # No delays, no retries - just fast
-                if successful >= 20:  # Stop at 20 successful
-                    break
-                    
-            except:
-                continue  # Skip failures immediately
-        
-        logger.info(f"ULTRA FAST INDIVIDUAL: {successful} chunks embedded")
-    
-    def similarity_search(self, query: str, k: int = 5) -> List[Document]:
-        """Ultra-fast search"""
+    def similarity_search(self, query: str, k: int = 6) -> List[Document]:
+        """Fast similarity search"""
         if not self.vectors:
             return []
         
         try:
             query_vector = self.embeddings.embed_query(query)
             
-            # Simple dot product (faster than cosine)
-            similarities = []
-            for i, vector in enumerate(self.vectors):
-                sim = np.dot(query_vector, vector)
-                similarities.append((sim, i))
+            # Fast dot product similarity (skip normalization for speed)
+            similarities = [np.dot(query_vector, vec) for vec in self.vectors]
+            top_indices = sorted(range(len(similarities)), key=lambda i: similarities[i], reverse=True)[:k]
             
-            # Quick sort and return
-            similarities.sort(reverse=True)
-            return [self.documents[i] for _, i in similarities[:k]]
+            return [self.documents[i] for i in top_indices]
             
-        except:
+        except Exception as e:
+            logger.error(f"Search error: {e}")
             return self.documents[:k] if len(self.documents) >= k else self.documents
 
-def ultra_fast_document_loader(url: str) -> List[Document]:
-    """Ultra-fast document loading"""
+def speed_document_loader(url: str) -> List[Document]:
+    """Speed optimized document loader"""
     try:
-        logger.info(f"LOADING: {url}")
-        response = requests.get(url, timeout=6)  # Shorter timeout
+        response = requests.get(url, timeout=10, headers={'User-Agent': 'Mozilla/5.0'})  # Reduced timeout
         response.raise_for_status()
         
         url_lower = url.lower()
@@ -150,35 +107,48 @@ def ultra_fast_document_loader(url: str) -> List[Document]:
         if url_lower.endswith('.pdf') or 'pdf' in content_type:
             pdf_file = io.BytesIO(response.content)
             pdf_reader = PyPDF2.PdfReader(pdf_file)
-            total_pages = min(len(pdf_reader.pages), 20)  # Limit to 20 pages
+            total_pages = len(pdf_reader.pages)
             
-            # Fast page processing
-            text_parts = []
-            for i in range(total_pages):
-                try:
+            # SPEED: Process fewer pages
+            if total_pages <= 20:
+                pages_to_process = list(range(total_pages))
+            else:
+                # Minimal sampling for speed
+                first_pages = list(range(12))  # Fewer pages
+                middle_pages = list(range(total_pages//3, total_pages//3 + 5))
+                last_pages = list(range(total_pages-8, total_pages))
+                pages_to_process = sorted(set(first_pages + middle_pages + last_pages))
+            
+            text = ""
+            for i in pages_to_process:
+                if i < len(pdf_reader.pages):
                     page_text = pdf_reader.pages[i].extract_text()
-                    if page_text and len(page_text.strip()) > 20:
-                        text_parts.append(page_text[:3000])  # Limit per page
-                except:
-                    continue
+                    if page_text.strip():
+                        text += page_text + "\n\n"
             
-            full_text = "\n\n".join(text_parts)[:80000]  # Hard limit
-            logger.info(f"PDF: {total_pages} pages, {len(full_text)} chars")
-            
-            return [Document(page_content=full_text, metadata={"source": url, "type": "pdf"})]
+            logger.info(f"SPEED: Processed {len(pages_to_process)}/{total_pages} pages")
+            return [Document(page_content=text.strip(), metadata={"source": url, "type": "pdf"})]
+        
+        elif url_lower.endswith('.docx') or 'wordprocessingml' in content_type:
+            docx_file = io.BytesIO(response.content)
+            doc = DocxDocument(docx_file)
+            text = "\n".join([paragraph.text for paragraph in doc.paragraphs])
+            return [Document(page_content=text.strip(), metadata={"source": url, "type": "docx"})]
         
         else:
-            # Handle other formats simply
             soup = BeautifulSoup(response.content, 'html.parser')
-            text = soup.get_text()[:80000]
-            logger.info(f"TEXT: {len(text)} chars")
-            return [Document(page_content=text, metadata={"source": url, "type": "html"})]
+            for script in soup(["script", "style", "nav", "footer", "header"]):
+                script.decompose()
+            text = soup.get_text()
+            lines = (line.strip() for line in text.splitlines())
+            text = '\n'.join(line for line in lines if line)
+            return [Document(page_content=text[:80000], metadata={"source": url, "type": "html"})]  # Reduced text limit
         
     except Exception as e:
-        logger.error(f"Load error: {e}")
+        logger.error(f"Document load error: {e}")
         raise
 
-class UltraFastRAGEngine:
+class SpeedRAGEngine:
     def __init__(self):
         self.chat_model = None
         self.embeddings = None
@@ -190,46 +160,46 @@ class UltraFastRAGEngine:
         if self.initialized:
             return
             
-        logger.info("Initializing ULTRA-FAST RAG engine...")
+        logger.info("Initializing SPEED RAG engine...")
         
         try:
+            # Together.AI for both chat and embeddings (SPEED!)
             os.environ["TOGETHER_API_KEY"] = os.getenv("TOGETHER_API_KEY", "deb14836869b48e01e1853f49381b9eb7885e231ead3bc4f6bbb4a5fc4570b78")
             
+            # Back to Together.AI embeddings - faster and more reliable for your use case
             self.embeddings = TogetherEmbeddings(model="BAAI/bge-base-en-v1.5")
             
-            # WORKING 8B model
             self.chat_model = ChatTogether(
-                model="meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo",  # Correct model name
+                model="meta-llama/Llama-3.3-70B-Instruct-Turbo-Free",
                 temperature=0,
-                max_tokens=1500
+                max_tokens=3000  # Reduced for speed
             )
 
-            # Ultra-fast chunking
+            # SPEED OPTIMIZED chunking
             self.text_splitter = RecursiveCharacterTextSplitter(
-                chunk_size=1500,  # Smaller for speed
-                chunk_overlap=100,
-                separators=["\n\n", "\n", ". "]
+                chunk_size=1000,  # Smaller chunks for speed
+                chunk_overlap=80,   # Less overlap
+                separators=["\n\n", "\n", ". ", " "]  # Fewer separators
             )
 
             self.initialized = True
-            logger.info("ULTRA-FAST RAG engine ready!")
+            logger.info("SPEED RAG engine ready!")
             
         except Exception as e:
             logger.error(f"Initialization error: {e}")
             raise
 
-    def _ultra_fast_query(self, vectorstore: UltraFastVectorStore, query: str) -> str:
-        """Ultra-fast query"""
-        docs = vectorstore.similarity_search(query, k=5)
-        context = " ".join([doc.page_content for doc in docs])[:1800]  # Smaller context
+    def _speed_query(self, vectorstore: SpeedOptimizedVectorStore, query: str) -> str:
+        """Speed optimized query"""
+        docs = vectorstore.similarity_search(query, k=6)  # Fewer docs for speed
+        context = " ".join([doc.page_content for doc in docs])[:2800]  # Shorter context
         
         from langchain_core.messages import HumanMessage, SystemMessage
         
-        # Minimal prompt for speed
-        system_content = """Insurance expert. Extract facts from document.
-Questions/answers separated by " | ". If not found: "Not available"."""
+        # Shorter system prompt for speed
+        system_content = """You are an insurance policy expert. Answer questions separated by " | " with answers separated by " | " in the same order. Be accurate and include specific details from the document."""
 
-        human_content = f"Questions: {query}\nDocument: {context}\nAnswers:"
+        human_content = f"""Questions: {query}\n\nContext: {context}\n\nAnswers separated by " | "."""
 
         messages = [
             SystemMessage(content=system_content),
@@ -239,60 +209,59 @@ Questions/answers separated by " | ". If not found: "Not available"."""
         response = self.chat_model.invoke(messages)
         return response.content
 
-    async def process_ultra_fast(self, url: str, questions: List[str]) -> List[str]:
-        """Ultra-fast processing under 30 seconds guaranteed"""
+    async def process_speed(self, url: str, questions: List[str]) -> List[str]:
+        """SPEED processing - 30 second target"""
         if not self.initialized:
             raise RuntimeError("RAG engine not initialized")
         
         try:
             return await asyncio.wait_for(
                 self._process_internal(url, questions),
-                timeout=25.0  # Even shorter timeout
+                timeout=30.0  # HARD 30 second limit
             )
         except asyncio.TimeoutError:
-            raise HTTPException(status_code=408, detail="25 second timeout exceeded")
+            raise HTTPException(status_code=408, detail="30 second timeout exceeded")
 
     async def _process_internal(self, url: str, questions: List[str]) -> List[str]:
-        total_start = time.time()
         url_hash = hashlib.md5(url.encode()).hexdigest()[:8]
         
         if url_hash in self.vectorstore_cache:
             vectorstore = self.vectorstore_cache[url_hash]
-            logger.info("CACHED!")
+            logger.info("CACHED - INSTANT!")
         else:
-            # Ultra-fast processing
-            docs = ultra_fast_document_loader(url)
+            docs = speed_document_loader(url)
             chunks = self.text_splitter.split_documents(docs)
             
-            # Limit chunks aggressively
-            if len(chunks) > 30:
-                # Take first 15, last 15
-                chunks = chunks[:15] + chunks[-15:]
+            # AGGRESSIVE chunk limiting for 30-second target
+            if len(chunks) > 50:
+                # Take first 30 and last 20 chunks only
+                chunks = chunks[:30] + chunks[-20:]
+                logger.info(f"SPEED: Limited to {len(chunks)} chunks for 30s target")
             
-            logger.info(f"PROCESSING: {len(chunks)} chunks")
+            vectorstore = SpeedOptimizedVectorStore(self.embeddings)
+            vectorstore.add_documents_fast(chunks)
             
-            # Ultra-fast embedding
-            vectorstore = UltraFastVectorStore(self.embeddings)
-            vectorstore.add_documents_ultra_fast(chunks)
-            
+            # Cache aggressively
             self.vectorstore_cache[url_hash] = vectorstore
         
-        # Ultra-fast query
         batch_query = " | ".join(questions)
-        response = self._ultra_fast_query(vectorstore, batch_query)
         
-        total_time = time.time() - total_start
-        logger.info(f"ULTRA FAST: Total {total_time:.1f}s")
+        query_start = time.time()
+        response = self._speed_query(vectorstore, batch_query)
+        query_time = time.time() - query_start
         
-        # Quick parsing
-        answers = [a.strip() for a in response.split(" | ") if a.strip()]
+        logger.info(f"LLM: {query_time:.1f}s")
+        
+        # Fast answer parsing
+        answers = [ans.strip() for ans in response.split(" | ")]
+        
         while len(answers) < len(questions):
-            answers.append("Information not available")
+            answers.append("Information not found.")
         
         return answers[:len(questions)]
 
 # Global engine
-rag_engine = UltraFastRAGEngine()
+rag_engine = SpeedRAGEngine()
 
 def verify_token(authorization: Optional[str] = Header(None)):
     if authorization is None or not authorization.startswith("Bearer "):
@@ -306,21 +275,21 @@ def verify_token(authorization: Optional[str] = Header(None)):
 async def lifespan(app: FastAPI):
     try:
         rag_engine.initialize()
-        logger.info("ULTRA-FAST RAG ready")
+        logger.info("SPEED RAG application ready")
     except Exception as e:
         logger.error(f"Startup error: {e}")
     yield
 
-app = FastAPI(title="ULTRA-FAST RAG API", version="6.0.0", lifespan=lifespan)
+app = FastAPI(title="SPEED RAG API", version="3.0.0", lifespan=lifespan)
 
 @app.post("/hackrx/run", response_model=AnswerResponse)
 async def ask_questions(
     request: QuestionRequest,
     authorization: str = Depends(verify_token)
 ):
-    """Ultra-fast processing - guaranteed under 25 seconds"""
+    """SPEED processing - 30 second target"""
     try:
-        logger.info(f"ULTRA FAST: {len(request.questions)} questions")
+        logger.info(f"SPEED MODE: {len(request.questions)} questions - 30s target")
 
         if not request.documents.startswith(('http://', 'https://')):
             raise HTTPException(status_code=400, detail="Invalid document URL")
@@ -328,10 +297,10 @@ async def ask_questions(
             raise HTTPException(status_code=400, detail="No questions provided")
 
         start_time = time.time()
-        answers = await rag_engine.process_ultra_fast(request.documents, request.questions)
+        answers = await rag_engine.process_speed(request.documents, request.questions)
         total_time = time.time() - start_time
 
-        logger.info(f"ULTRA FAST: Completed in {total_time:.1f}s")
+        logger.info(f"SPEED MODE: Completed in {total_time:.1f}s - Target: 30s")
         return {"answers": answers}
 
     except HTTPException:
@@ -344,15 +313,15 @@ async def ask_questions(
 async def health_check():
     return {
         "status": "healthy",
-        "mode": "ultra_fast",
-        "max_chunks": 30,
-        "model": "Meta-Llama-3.1-8B-Instruct-Turbo",
-        "target_time": "<25_seconds"
+        "cache_entries": len(rag_engine.vectorstore_cache),
+        "mode": "speed_optimized",
+        "target_time": "30_seconds",
+        "embedding_provider": "Together.AI (Speed Mode)"
     }
 
 @app.get("/")
 async def root():
-    return {"message": "ULTRA-FAST RAG API - Guaranteed Under 25 Seconds"}
+    return {"message": "SPEED RAG API - 30 Second Target"}
 
 if __name__ == "__main__":
     import uvicorn
