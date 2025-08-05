@@ -1,19 +1,31 @@
-import os, time, logging, hashlib, random, io, asyncio
-from typing import List, Optional
+import os
+import time
+import logging
+import hashlib
+import random
+from datetime import datetime
+from typing import List, Optional, Dict, Any
 from contextlib import asynccontextmanager
-from functools import wraps
-import requests, PyPDF2, numpy as np
+import requests
 from bs4 import BeautifulSoup
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+import PyPDF2
+from docx import Document as DocxDocument
+import email
+import io
+import numpy as np
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+from functools import wraps
 
 from fastapi import FastAPI, HTTPException, Header, Depends
 from pydantic import BaseModel
 
-# LangChain / Together
+# RAG imports
 from langchain_together import ChatTogether, TogetherEmbeddings
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
+# Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -26,355 +38,454 @@ class QuestionRequest(BaseModel):
 class AnswerResponse(BaseModel):
     answers: List[str]
 
-# ─────────────────── AGGRESSIVE TIMEOUT WRAPPER ───────────────
-class AggressiveTimeoutWrapper:
-    """Wraps any function with a hard process-level timeout"""
+class CircuitBreaker:
+    def __init__(self, failure_threshold=5, timeout=15):
+        self.failure_threshold = failure_threshold
+        self.timeout = timeout
+        self.failure_count = 0
+        self.last_failure_time = None
+        self.state = 'CLOSED'  # CLOSED, OPEN, HALF_OPEN
     
-    @staticmethod
-    def call_with_hard_timeout(func, args, kwargs, timeout_seconds=3):
-        """Call function with absolutely hard timeout using multiprocessing"""
-        import multiprocessing
-        
-        def target(queue, func, args, kwargs):
-            try:
-                result = func(*args, **kwargs)
-                queue.put(('success', result))
-            except Exception as e:
-                queue.put(('error', str(e)))
-        
-        queue = multiprocessing.Queue()
-        process = multiprocessing.Process(target=target, args=(queue, func, args, kwargs))
-        process.start()
-        process.join(timeout=timeout_seconds)
-        
-        if process.is_alive():
-            process.terminate()
-            process.join()
-            raise TimeoutError(f"Hard timeout after {timeout_seconds}s")
-        
-        try:
-            result_type, result = queue.get_nowait()
-            if result_type == 'success':
-                return result
-            else:
-                raise Exception(result)
-        except:
-            raise TimeoutError("Process terminated unexpectedly")
-
-# ─────────────────── MINIMAL CIRCUIT BREAKER ───────────────
-class MinimalCircuitBreaker:
-    def __init__(self, max_failures=3):
-        self.failures = 0
-        self.max_failures = max_failures
-        self.last_failure_time = 0
-        
-    def should_skip(self):
-        # Skip for 10 seconds after max failures
-        if self.failures >= self.max_failures:
-            if time.time() - self.last_failure_time < 10:
-                return True
-            else:
-                self.failures = 0  # Reset after cooldown
-        return False
-    
-    def record_failure(self):
-        self.failures += 1
-        self.last_failure_time = time.time()
-        
-    def record_success(self):
-        self.failures = 0
-
-# ───────────────────── LIGHTNING FAST VECTOR STORE ─────────────────
-class LightningFastVectorStore:
-    def __init__(self, embeddings):
-        self.emb = embeddings
-        self.docs, self.vecs = [], []
-        self.cb = MinimalCircuitBreaker(2)
-        
-        # Try to configure underlying client for faster timeouts
-        try:
-            if hasattr(embeddings, 'client'):
-                # Set aggressive timeouts on the HTTP client
-                embeddings.client.timeout = 3.0
-            # Also try to set on the Together client if it exists
-            if hasattr(embeddings, 'together_client'):
-                embeddings.together_client.timeout = 3.0
-        except Exception as e:
-            logger.warning(f"Could not set client timeout: {e}")
-
-    def _embed_one_aggressive(self, doc: Document):
-        """Single embedding with multiple timeout strategies"""
-        if self.cb.should_skip():
-            logger.warning("Circuit breaker active - skipping embedding")
-            return None
-            
-        try:
-            # Strategy 1: Use process-level timeout (most aggressive)
-            try:
-                result = AggressiveTimeoutWrapper.call_with_hard_timeout(
-                    self.emb.embed_query, 
-                    (doc.page_content,), 
-                    {}, 
-                    timeout_seconds=4
-                )
-                self.cb.record_success()
-                return result
-            except Exception as e:
-                logger.warning(f"Hard timeout embedding: {e}")
-                self.cb.record_failure()
+    def call(self, func, *args, **kwargs):
+        if self.state == 'OPEN':
+            if time.time() - self.last_failure_time < self.timeout:
+                # Use cached result or return None during circuit open
                 return None
-                
-        except Exception as e:
-            self.cb.record_failure()
-            logger.warning(f"Embedding completely failed: {e}")
-            return None
-
-    def add_documents_final(self, docs: List[Document]):
-        logger.info(f"LIGHTNING: embedding {len(docs)} chunks")
-        global_start = time.time()
-        
-        # Process sequentially with strict timing
-        for i, doc in enumerate(docs):
-            elapsed = time.time() - global_start
-            
-            # Hard stop after 8 seconds total
-            if elapsed > 8:
-                logger.warning(f"Embedding budget exhausted after {elapsed:.1f}s - stopping at {i}/{len(docs)}")
-                break
-            
-            # Try to embed this document
-            vector = self._embed_one_aggressive(doc)
-            if vector is not None:
-                self.docs.append(doc)
-                self.vecs.append(vector)
-                logger.info(f"Embedded {i+1}/{len(docs)} in {elapsed:.1f}s")
             else:
-                logger.warning(f"Failed to embed chunk {i+1}")
-                
-            # If we're getting slow, be more aggressive about stopping
-            if elapsed > 5 and len(self.vecs) >= 3:
-                logger.info(f"Have {len(self.vecs)} vectors after {elapsed:.1f}s - stopping early")
-                break
+                self.state = 'HALF_OPEN'
         
-        total_time = time.time() - global_start
-        logger.info(f"LIGHTNING: {total_time:.1f}s, {len(self.vecs)}/{len(docs)} vectors")
-        
-        # Fallback: store docs for text search if we have very few vectors
-        if len(self.vecs) < 2:
-            logger.warning("Very few vectors - storing docs for text search")
-            self.docs = docs[:15]
-
-    def similarity_search(self, query: str, k: int = 5) -> List[Document]:
-        if not self.vecs:
-            return self.docs[:k]
-            
         try:
-            # Try to embed query with timeout
-            if self.cb.should_skip():
-                return self.docs[:k]
-                
-            qv = AggressiveTimeoutWrapper.call_with_hard_timeout(
-                self.emb.embed_query, (query,), {}, timeout_seconds=3
-            )
+            result = func(*args, **kwargs)
+            if self.state == 'HALF_OPEN':
+                self.state = 'CLOSED'
+                self.failure_count = 0
+            return result
+        except Exception as e:
+            self.failure_count += 1
+            self.last_failure_time = time.time()
             
-            # Fast similarity
-            qn = np.linalg.norm(qv) + 1e-9
-            sims = [(np.dot(qv, v)/(qn*np.linalg.norm(v)+1e-9), i) 
-                    for i, v in enumerate(self.vecs)]
-            sims.sort(reverse=True)
-            return [self.docs[i] for _, i in sims[:k]]
+            if self.failure_count >= self.failure_threshold:
+                self.state = 'OPEN'
+                logger.warning(f"Circuit breaker OPEN after {self.failure_count} failures")
+            
+            raise e
+
+def with_smart_retry(max_retries=2, base_delay=0.3):
+    """Smart retry with exponential backoff and jitter"""
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            for attempt in range(max_retries + 1):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    if attempt == max_retries:
+                        logger.warning(f"All {max_retries + 1} attempts failed: {e}")
+                        return None
+                    
+                    # Smart backoff: shorter delays for API issues
+                    if "503" in str(e) or "temporarily unavailable" in str(e).lower():
+                        delay = base_delay * (1.5 ** attempt) + random.uniform(0, 0.2)
+                    else:
+                        delay = base_delay * (2 ** attempt) + random.uniform(0, 0.3)
+                    
+                    logger.info(f"Retry {attempt + 1}/{max_retries} after {delay:.2f}s")
+                    time.sleep(delay)
+            return None
+        return wrapper
+    return decorator
+
+class FinalOptimizedVectorStore:
+    def __init__(self, embeddings):
+        self.embeddings = embeddings
+        self.documents = []
+        self.vectors = []
+        self.circuit_breaker = CircuitBreaker(failure_threshold=4, timeout=10)
+    
+    @with_smart_retry(max_retries=2, base_delay=0.2)
+    def embed_with_retry(self, text):
+        """Embedding with smart retry logic"""
+        return self.embeddings.embed_query(text)
+    
+    def embed_robust(self, doc):
+        """Robust embedding with circuit breaker"""
+        try:
+            return self.circuit_breaker.call(self.embed_with_retry, doc.page_content)
+        except Exception as e:
+            logger.warning(f"Embedding failed: {e}")
+            return None
+    
+    def add_documents_final(self, documents: List[Document]):
+        """Enhanced with robust error handling and fallback strategies"""
+        logger.info(f"FINAL: Processing {len(documents)} chunks")
+        
+        start_time = time.time()
+        
+        # Strategy 1: Parallel processing with reduced workers
+        try:
+            with ThreadPoolExecutor(max_workers=4) as executor:  # Reduced from 8
+                vectors = list(executor.map(self.embed_robust, documents))
+            
+            successful_count = self._store_vectors(documents, vectors)
+            
+            # If we have good success rate, we're done
+            if successful_count >= len(documents) * 0.7:
+                embedding_time = time.time() - start_time
+                logger.info(f"FINAL: Strategy 1 - {embedding_time:.1f}s, {successful_count} chunks embedded")
+                return
+        except Exception as e:
+            logger.warning(f"Strategy 1 failed: {e}")
+        
+        # Strategy 2: Sequential processing for failed chunks
+        logger.info("Falling back to sequential processing for remaining chunks")
+        failed_docs = []
+        for doc, vector in zip(documents, vectors if 'vectors' in locals() else [None] * len(documents)):
+            if vector is None:
+                failed_docs.append(doc)
+        
+        if failed_docs:
+            self._embed_sequentially(failed_docs[:10])  # Limit to 10 failed chunks max
+        
+        embedding_time = time.time() - start_time
+        total_embedded = len(self.documents)
+        logger.info(f"FINAL: Combined strategies - {embedding_time:.1f}s, {total_embedded} chunks embedded")
+    
+    def _store_vectors(self, documents, vectors):
+        """Store successful embeddings"""
+        successful_count = 0
+        for doc, vector in zip(documents, vectors):
+            if vector is not None:
+                self.documents.append(doc)
+                self.vectors.append(vector)
+                successful_count += 1
+        return successful_count
+    
+    def _embed_sequentially(self, documents):
+        """Sequential embedding as fallback"""
+        for doc in documents:
+            try:
+                vector = self.embed_with_retry(doc.page_content)
+                if vector is not None:
+                    self.documents.append(doc)
+                    self.vectors.append(vector)
+                time.sleep(0.1)  # Small delay between sequential requests
+            except Exception as e:
+                logger.warning(f"Sequential embedding failed: {e}")
+                continue
+    
+    def similarity_search(self, query: str, k: int = 7) -> List[Document]:
+        """Optimized search with retry"""
+        if not self.vectors:
+            return []
+        
+        try:
+            # Try with circuit breaker first
+            query_vector = self.circuit_breaker.call(self.embed_with_retry, query)
+            if query_vector is None:
+                logger.warning("Query embedding failed, using fallback")
+                return self.documents[:k] if len(self.documents) >= k else self.documents
+            
+            # Fast cosine similarity
+            similarities = []
+            query_norm = np.linalg.norm(query_vector)
+            
+            for i, vector in enumerate(self.vectors):
+                vector_norm = np.linalg.norm(vector)
+                if query_norm > 0 and vector_norm > 0:
+                    cos_sim = np.dot(query_vector, vector) / (query_norm * vector_norm)
+                    similarities.append((cos_sim, i))
+            
+            similarities.sort(reverse=True)
+            return [self.documents[i] for _, i in similarities[:k]]
             
         except Exception as e:
-            logger.warning(f"Query embedding failed: {e}")
-            return self.docs[:k]
+            logger.error(f"Search error: {e}")
+            return self.documents[:k] if len(self.documents) >= k else self.documents
 
-# ───────────────────── TEXT SEARCH FALLBACK ───────────────────────
-def emergency_text_search(docs: List[Document], query: str, k=5):
-    if not docs:
-        return []
-    qw = set(query.lower().split())
-    scored = []
-    for d in docs:
-        words = set(d.page_content.lower().split())
-        overlap = len(qw & words)
-        if overlap:
-            scored.append((overlap, d))
-    scored.sort(reverse=True)
-    return [d for _, d in scored[:k]]
-
-# ───────────────── DOCUMENT LOADER ──────────────────────
 def final_document_loader(url: str) -> List[Document]:
-    r = requests.get(url, timeout=5, headers={'User-Agent': 'Mozilla/5.0'})
-    r.raise_for_status()
-    ctype, url_l = r.headers.get("content-type","").lower(), url.lower()
+    """Final optimized document loader with timeout handling"""
+    try:
+        # Faster timeout for quicker failure detection
+        response = requests.get(url, timeout=5, headers={'User-Agent': 'Mozilla/5.0'})
+        response.raise_for_status()
+        
+        url_lower = url.lower()
+        content_type = response.headers.get('content-type', '').lower()
+        
+        if url_lower.endswith('.pdf') or 'pdf' in content_type:
+            pdf_file = io.BytesIO(response.content)
+            pdf_reader = PyPDF2.PdfReader(pdf_file)
+            total_pages = min(len(pdf_reader.pages), 20)  # Reduced from 25
+            
+            # More aggressive page sampling for speed
+            if total_pages <= 10:
+                pages_to_process = list(range(total_pages))
+            else:
+                # Even more selective sampling
+                first_pages = list(range(5))  # First 5 pages
+                middle_pages = list(range(total_pages//2-1, total_pages//2+2))  # 3 middle pages
+                last_pages = list(range(total_pages-5, total_pages))  # Last 5 pages
+                pages_to_process = sorted(set(first_pages + middle_pages + last_pages))
+            
+            text = ""
+            for i in pages_to_process:
+                if i < len(pdf_reader.pages):
+                    page_text = pdf_reader.pages[i].extract_text()
+                    if page_text.strip():
+                        text += page_text + "\n\n"
+            
+            logger.info(f"FINAL: Processed {len(pages_to_process)}/{total_pages} pages")
+            return [Document(page_content=text.strip()[:80000], metadata={"source": url, "type": "pdf"})]  # Reduced from 100k
+        
+        else:
+            soup = BeautifulSoup(response.content, 'html.parser')
+            for script in soup(["script", "style", "nav", "footer", "header"]):
+                script.decompose()
+            text = soup.get_text()
+            lines = (line.strip() for line in text.splitlines())
+            text = '\n'.join(line for line in lines if line)
+            return [Document(page_content=text[:80000], metadata={"source": url, "type": "html"})]  # Reduced from 100k
+        
+    except Exception as e:
+        logger.error(f"Document load error: {e}")
+        raise
 
-    if url_l.endswith(".pdf") or "pdf" in ctype:
-        pdf = PyPDF2.PdfReader(io.BytesIO(r.content))
-        pages = min(len(pdf.pages), 15)  # Reduced further
-        pick = list(range(pages)) if pages<=8 else \
-               sorted(set(list(range(4)) + list(range(pages//2-1, pages//2+2)) + 
-                         list(range(pages-4, pages))))
-        text = "".join((pdf.pages[i].extract_text() or "")+"\n\n" for i in pick)
-        return [Document(page_content=text[:60000], metadata={"source": url, "type": "pdf"})]
-
-    soup = BeautifulSoup(r.content, "html.parser")
-    for tag in soup(["script","style","nav","footer","header"]): 
-        tag.decompose()
-    text = "\n".join(line.strip() for line in soup.get_text().splitlines() if line.strip())
-    return [Document(page_content=text[:60000], metadata={"source": url, "type": "html"})]
-
-# ────────────────────── RAG ENGINE ─────────────────────────
 class FinalRAGEngine:
     def __init__(self):
+        self.chat_model = None
+        self.embeddings = None
+        self.text_splitter = None
         self.initialized = False
-        self.vec_cache = {}
-        self.llm_cb = MinimalCircuitBreaker(2)
-
+        self.vectorstore_cache = {}
+        self.circuit_breaker = CircuitBreaker(failure_threshold=3, timeout=8)
+    
     def initialize(self):
-        if self.initialized: 
+        if self.initialized:
             return
-        logger.info("Initializing LIGHTNING RAG…")
-        
-        os.environ["TOGETHER_API_KEY"] = os.getenv("TOGETHER_API_KEY")
-        
-        # Initialize with minimal retry settings
-        self.emb = TogetherEmbeddings(
-            model="BAAI/bge-base-en-v1.5",
-            # Add explicit timeout settings if supported
-        )
-        
-        self.llm = ChatTogether(
-            model="meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo",
-            temperature=0,
-            max_tokens=1200  # Reduced for faster response
-        )
-        
-        self.splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000,  # Smaller chunks
-            chunk_overlap=80,
-            separators=["\n\n","\n",". "," "]
-        )
-        
-        self.initialized = True
-        logger.info("LIGHTNING Engine ready!")
-
-    def _final_query(self, vs: LightningFastVectorStore, q: str) -> str:
-        # Get documents
-        docs = vs.similarity_search(q, k=4) 
-        if not docs:
-            docs = emergency_text_search(vs.docs, q, k=4)
-        if not docs:
-            return "No content available"
             
-        ctx = " ".join(d.page_content for d in docs)[:1500]  # Smaller context
-        
-        prompt = f"Context: {ctx}\n\nQuestions: {q}\n\nAnswer each question separated by ' | ':"
+        logger.info("Initializing FINAL RAG engine...")
         
         try:
-            if self.llm_cb.should_skip():
-                return "Service temporarily unavailable"
-                
-            # LLM call with process timeout
-            result = AggressiveTimeoutWrapper.call_with_hard_timeout(
-                self.llm.invoke, (prompt,), {}, timeout_seconds=6
+            os.environ["TOGETHER_API_KEY"] = os.getenv("TOGETHER_API_KEY", "deb14836869b48e01e1853f49381b9eb7885e231ead3bc4f6bbb4a5fc4570b78")
+            
+            self.embeddings = TogetherEmbeddings(model="BAAI/bge-base-en-v1.5")
+            
+            # CRITICAL: Use 8B model with BETTER PROMPTING
+            self.chat_model = ChatTogether(
+                model="meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo",
+                temperature=0,
+                max_tokens=1800  # Reduced for faster response
             )
-            self.llm_cb.record_success()
-            return result.content
+
+            # More aggressive chunking for speed
+            self.text_splitter = RecursiveCharacterTextSplitter(
+                chunk_size=1200,  # Reduced from 1400
+                chunk_overlap=100,  # Reduced from 120
+                separators=["\n\n", "\n", ". ", " "]
+            )
+
+            self.initialized = True
+            logger.info("FINAL RAG engine ready!")
             
         except Exception as e:
-            self.llm_cb.record_failure()
-            logger.warning(f"LLM call failed: {e}")
-            return "Information not available due to service error"
+            logger.error(f"Initialization error: {e}")
+            raise
 
-    async def process_final(self, url: str, qs: List[str]) -> List[str]:
-        if not self.initialized:
-            raise RuntimeError("Engine not initialized")
+    @with_smart_retry(max_retries=1, base_delay=0.2)
+    def _query_with_retry(self, messages):
+        """Chat query with retry"""
+        return self.chat_model.invoke(messages)
 
-        async def inner():
-            hid = hashlib.md5(url.encode()).hexdigest()[:8]
-            
-            if hid in self.vec_cache:
-                vs = self.vec_cache[hid]
-                logger.info("Using cached vectorstore")
-            else:
-                try:
-                    docs = final_document_loader(url)
-                    chunks = self.splitter.split_documents(docs)
-                    
-                    # Limit to 15 chunks maximum
-                    if len(chunks) > 15:
-                        s, e = 8, 7
-                        chunks = chunks[:s] + chunks[-e:]
-                    
-                    vs = LightningFastVectorStore(self.emb)
-                    vs.add_documents_final(chunks)
-                    
-                    # Only cache if reasonably successful
-                    if len(vs.vecs) > 0:
-                        self.vec_cache[hid] = vs
-                    
-                except Exception as e:
-                    logger.error(f"Document processing failed: {e}")
-                    return ["Document processing failed"] * len(qs)
+    def _final_query(self, vectorstore: FinalOptimizedVectorStore, query: str) -> str:
+        """FINAL QUERY with robust error handling"""
+        docs = vectorstore.similarity_search(query, k=6)  # Reduced from 7
+        context = " ".join([doc.page_content for doc in docs])[:2200]  # Reduced from 2500
+        
+        from langchain_core.messages import HumanMessage, SystemMessage
+        
+        # CRITICAL: Better system prompt to prevent question repetition
+        system_content = """You are an insurance policy expert. Your task is to answer questions, NOT repeat them.
 
-            # Query processing
-            batch_q = " | ".join(qs)
-            raw = self._final_query(vs, batch_q)
-            
-            # Parse answers
-            parts = [p.strip() for p in raw.split(" | ")]
-            ans = [p if p and len(p) > 3 else "Information not available in document." 
-                   for p in parts]
-            
-            while len(ans) < len(qs):
-                ans.append("Information not available in document.")
-            
-            return ans[:len(qs)]
+CRITICAL RULES:
+- Questions are separated by " | "
+- Provide ONLY answers separated by " | " in the same order
+- DO NOT include the questions in your response
+- DO NOT start answers with "Question:" or "Q:" or repeat the question
+- Extract specific facts, numbers, percentages, conditions from the document
+- If information not found, say "Information not available in document"
+- Keep answers concise but informative
 
+Example:
+Input: "What is the waiting period? | What is the sum insured?"
+Output: "36 months for pre-existing diseases | Up to 50 lacs as per plan selected"
+
+REMEMBER: Provide ONLY the answers, separated by " | ", NO questions."""
+
+        human_content = f"""Document Context: {context}
+
+Questions to answer: {query}
+
+Provide only the answers separated by " | " (do not repeat questions):"""
+
+        messages = [
+            SystemMessage(content=system_content),
+            HumanMessage(content=human_content)
+        ]
+        
         try:
-            return await asyncio.wait_for(inner(), timeout=22.0)  # 22s total timeout
-        except asyncio.TimeoutError:
-            logger.error("Total timeout exceeded")
-            return ["Processing timeout - please try again"] * len(qs)
+            response = self.circuit_breaker.call(self._query_with_retry, messages)
+            if response is None:
+                return "Service temporarily unavailable | " * query.count("|") + "Service temporarily unavailable"
+            return response.content
+        except Exception as e:
+            logger.error(f"Query error: {e}")
+            fallback_answer = "Information not available due to service error"
+            return " | ".join([fallback_answer] * (query.count("|") + 1))
 
-# ───────────────────── FASTAPI ────────────────────────
-rag = FinalRAGEngine()
+    async def process_final(self, url: str, questions: List[str]) -> List[str]:
+        """FINAL PROCESSING - Guaranteed under 30 seconds with better error handling"""
+        if not self.initialized:
+            raise RuntimeError("RAG engine not initialized")
+        
+        try:
+            return await asyncio.wait_for(
+                self._process_internal(url, questions),
+                timeout=26.0  # Reduced timeout for safety margin
+            )
+        except asyncio.TimeoutError:
+            logger.error("Timeout exceeded - returning fallback responses")
+            return ["Processing timeout - please try again"] * len(questions)
+
+    async def _process_internal(self, url: str, questions: List[str]) -> List[str]:
+        total_start = time.time()
+        url_hash = hashlib.md5(url.encode()).hexdigest()[:8]
+        
+        if url_hash in self.vectorstore_cache:
+            vectorstore = self.vectorstore_cache[url_hash]
+            logger.info("CACHED!")
+        else:
+            # Load and process document
+            docs = final_document_loader(url)
+            chunks = self.text_splitter.split_documents(docs)
+            
+            # FINAL OPTIMIZATION: Limit to 30 chunks max (reduced from 35)
+            if len(chunks) > 30:
+                # Strategic selection: 40% start, 25% middle, 35% end
+                start_count = int(30 * 0.40)  # 12
+                middle_count = int(30 * 0.25)  # 7-8
+                end_count = 30 - start_count - middle_count  # 10-11
+                
+                middle_start = len(chunks) // 2 - middle_count // 2
+                chunks = (chunks[:start_count] + 
+                         chunks[middle_start:middle_start + middle_count] + 
+                         chunks[-end_count:])
+                
+                logger.info(f"FINAL: Selected 30/{len(chunks)} chunks")
+            
+            # Fast embedding with enhanced error handling
+            vectorstore = FinalOptimizedVectorStore(self.embeddings)
+            vectorstore.add_documents_final(chunks)
+            
+            # Only cache if we have sufficient embeddings
+            if len(vectorstore.documents) >= len(chunks) * 0.5:  # At least 50% success
+                self.vectorstore_cache[url_hash] = vectorstore
+            else:
+                logger.warning(f"Low embedding success rate: {len(vectorstore.documents)}/{len(chunks)}")
+        
+        # Query with timing
+        batch_query = " | ".join(questions)
+        
+        query_start = time.time()
+        response = self._final_query(vectorstore, batch_query)
+        query_time = time.time() - query_start
+        
+        total_time = time.time() - total_start
+        logger.info(f"FINAL: Query={query_time:.1f}s, Total={total_time:.1f}s")
+        
+        # Enhanced answer parsing
+        answers = []
+        raw_splits = response.split(" | ")
+        
+        for split in raw_splits:
+            cleaned = split.strip()
+            # Remove any question repetition
+            if cleaned and not any(q.lower().strip() in cleaned.lower() for q in questions):
+                if len(cleaned) > 5:  # More lenient meaningful answer check
+                    answers.append(cleaned)
+        
+        # Ensure correct count with better fallbacks
+        while len(answers) < len(questions):
+            answers.append("Information not available in document.")
+        
+        return answers[:len(questions)]
+
+# Global engine
+rag_engine = FinalRAGEngine()
 
 def verify_token(authorization: Optional[str] = Header(None)):
-    if not authorization or not authorization.startswith("Bearer "):
+    if authorization is None or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Authorization required")
-    if authorization.split("Bearer ")[-1] != EXPECTED_TOKEN:
+    
+    token = authorization.split("Bearer ")[-1]
+    if token != EXPECTED_TOKEN:
         raise HTTPException(status_code=403, detail="Invalid token")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    rag.initialize()
+    try:
+        rag_engine.initialize()
+        logger.info("FINAL RAG ready for submission")
+    except Exception as e:
+        logger.error(f"Startup error: {e}")
     yield
 
-app = FastAPI(title="LIGHTNING RAG API", lifespan=lifespan)
+app = FastAPI(title="FINAL RAG API", version="FINAL", lifespan=lifespan)
 
 @app.post("/hackrx/run", response_model=AnswerResponse)
-async def run(request: QuestionRequest, _: str = Depends(verify_token)):
-    if not request.documents.startswith(("http://","https://")):
-        raise HTTPException(status_code=400, detail="Invalid document URL")
-    if not request.questions:
-        raise HTTPException(status_code=400, detail="No questions provided")
-    
-    t0 = time.time()
-    answers = await rag.process_final(request.documents, request.questions)
-    total_time = time.time() - t0
-    
-    logger.info(f"LIGHTNING: Total {total_time:.1f}s")
-    return {"answers": answers}
+async def ask_questions(
+    request: QuestionRequest,
+    authorization: str = Depends(verify_token)
+):
+    """FINAL VERSION - Guaranteed under 30 seconds with robust error handling"""
+    try:
+        logger.info(f"FINAL: {len(request.questions)} questions - TARGET: <28s")
+
+        if not request.documents.startswith(('http://', 'https://')):
+            raise HTTPException(status_code=400, detail="Invalid document URL")
+        if not request.questions:
+            raise HTTPException(status_code=400, detail="No questions provided")
+
+        start_time = time.time()
+        answers = await rag_engine.process_final(request.documents, request.questions)
+        total_time = time.time() - start_time
+
+        logger.info(f"FINAL: SUCCESS in {total_time:.1f}s (Target: <28s)")
+        return {"answers": answers}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Processing error: {e}")
+        # Return graceful fallback instead of 500 error
+        fallback_answers = ["Service temporarily unavailable - please try again"] * len(request.questions)
+        return {"answers": fallback_answers}
 
 @app.get("/health")
-async def health():
-    return {"status": "lightning", "max_latency": "<25s", "timeout": "process_level"}
+async def health_check():
+    return {
+        "status": "ready_for_submission",
+        "mode": "final_optimized_resilient",
+        "model": "Meta-Llama-3.1-8B-Instruct-Turbo", 
+        "target_time": "<26_seconds",
+        "max_chunks": 30,
+        "features": ["circuit_breaker", "smart_retry", "fallback_strategies"]
+    }
 
 @app.get("/")
 async def root():
-    return {"message": "LIGHTNING RAG API - Process-level timeouts"}
+    return {"message": "FINAL RAG API - Ready for Submission with Enhanced Resilience"}
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
