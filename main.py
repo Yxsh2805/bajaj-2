@@ -2,6 +2,7 @@ import os
 import time
 import logging
 import hashlib
+import random
 from datetime import datetime
 from typing import List, Optional, Dict, Any
 from contextlib import asynccontextmanager
@@ -14,6 +15,7 @@ import io
 import numpy as np
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
+from functools import wraps
 
 from fastapi import FastAPI, HTTPException, Header, Depends
 from pydantic import BaseModel
@@ -36,47 +38,152 @@ class QuestionRequest(BaseModel):
 class AnswerResponse(BaseModel):
     answers: List[str]
 
+class CircuitBreaker:
+    def __init__(self, failure_threshold=5, timeout=15):
+        self.failure_threshold = failure_threshold
+        self.timeout = timeout
+        self.failure_count = 0
+        self.last_failure_time = None
+        self.state = 'CLOSED'  # CLOSED, OPEN, HALF_OPEN
+    
+    def call(self, func, *args, **kwargs):
+        if self.state == 'OPEN':
+            if time.time() - self.last_failure_time < self.timeout:
+                # Use cached result or return None during circuit open
+                return None
+            else:
+                self.state = 'HALF_OPEN'
+        
+        try:
+            result = func(*args, **kwargs)
+            if self.state == 'HALF_OPEN':
+                self.state = 'CLOSED'
+                self.failure_count = 0
+            return result
+        except Exception as e:
+            self.failure_count += 1
+            self.last_failure_time = time.time()
+            
+            if self.failure_count >= self.failure_threshold:
+                self.state = 'OPEN'
+                logger.warning(f"Circuit breaker OPEN after {self.failure_count} failures")
+            
+            raise e
+
+def with_smart_retry(max_retries=2, base_delay=0.3):
+    """Smart retry with exponential backoff and jitter"""
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            for attempt in range(max_retries + 1):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    if attempt == max_retries:
+                        logger.warning(f"All {max_retries + 1} attempts failed: {e}")
+                        return None
+                    
+                    # Smart backoff: shorter delays for API issues
+                    if "503" in str(e) or "temporarily unavailable" in str(e).lower():
+                        delay = base_delay * (1.5 ** attempt) + random.uniform(0, 0.2)
+                    else:
+                        delay = base_delay * (2 ** attempt) + random.uniform(0, 0.3)
+                    
+                    logger.info(f"Retry {attempt + 1}/{max_retries} after {delay:.2f}s")
+                    time.sleep(delay)
+            return None
+        return wrapper
+    return decorator
+
 class FinalOptimizedVectorStore:
     def __init__(self, embeddings):
         self.embeddings = embeddings
         self.documents = []
         self.vectors = []
+        self.circuit_breaker = CircuitBreaker(failure_threshold=4, timeout=10)
+    
+    @with_smart_retry(max_retries=2, base_delay=0.2)
+    def embed_with_retry(self, text):
+        """Embedding with smart retry logic"""
+        return self.embeddings.embed_query(text)
+    
+    def embed_robust(self, doc):
+        """Robust embedding with circuit breaker"""
+        try:
+            return self.circuit_breaker.call(self.embed_with_retry, doc.page_content)
+        except Exception as e:
+            logger.warning(f"Embedding failed: {e}")
+            return None
     
     def add_documents_final(self, documents: List[Document]):
-        """FINAL OPTIMIZATION - Maximum speed with good accuracy"""
+        """Enhanced with robust error handling and fallback strategies"""
         logger.info(f"FINAL: Processing {len(documents)} chunks")
         
         start_time = time.time()
         
-        def embed_fast_fail(doc):
-            """One attempt only - no retries for maximum speed"""
-            try:
-                return self.embeddings.embed_query(doc.page_content)
-            except Exception as e:
-                return None  # Immediate failure, no retry
+        # Strategy 1: Parallel processing with reduced workers
+        try:
+            with ThreadPoolExecutor(max_workers=4) as executor:  # Reduced from 8
+                vectors = list(executor.map(self.embed_robust, documents))
+            
+            successful_count = self._store_vectors(documents, vectors)
+            
+            # If we have good success rate, we're done
+            if successful_count >= len(documents) * 0.7:
+                embedding_time = time.time() - start_time
+                logger.info(f"FINAL: Strategy 1 - {embedding_time:.1f}s, {successful_count} chunks embedded")
+                return
+        except Exception as e:
+            logger.warning(f"Strategy 1 failed: {e}")
         
-        # 8 workers - optimal for Together.AI
-        with ThreadPoolExecutor(max_workers=8) as executor:
-            vectors = list(executor.map(embed_fast_fail, documents))
+        # Strategy 2: Sequential processing for failed chunks
+        logger.info("Falling back to sequential processing for remaining chunks")
+        failed_docs = []
+        for doc, vector in zip(documents, vectors if 'vectors' in locals() else [None] * len(documents)):
+            if vector is None:
+                failed_docs.append(doc)
         
-        # Store only successful embeddings
+        if failed_docs:
+            self._embed_sequentially(failed_docs[:10])  # Limit to 10 failed chunks max
+        
+        embedding_time = time.time() - start_time
+        total_embedded = len(self.documents)
+        logger.info(f"FINAL: Combined strategies - {embedding_time:.1f}s, {total_embedded} chunks embedded")
+    
+    def _store_vectors(self, documents, vectors):
+        """Store successful embeddings"""
         successful_count = 0
         for doc, vector in zip(documents, vectors):
             if vector is not None:
                 self.documents.append(doc)
                 self.vectors.append(vector)
                 successful_count += 1
-        
-        embedding_time = time.time() - start_time
-        logger.info(f"FINAL: {embedding_time:.1f}s, {successful_count} chunks embedded")
+        return successful_count
+    
+    def _embed_sequentially(self, documents):
+        """Sequential embedding as fallback"""
+        for doc in documents:
+            try:
+                vector = self.embed_with_retry(doc.page_content)
+                if vector is not None:
+                    self.documents.append(doc)
+                    self.vectors.append(vector)
+                time.sleep(0.1)  # Small delay between sequential requests
+            except Exception as e:
+                logger.warning(f"Sequential embedding failed: {e}")
+                continue
     
     def similarity_search(self, query: str, k: int = 7) -> List[Document]:
-        """Optimized search"""
+        """Optimized search with retry"""
         if not self.vectors:
             return []
         
         try:
-            query_vector = self.embeddings.embed_query(query)
+            # Try with circuit breaker first
+            query_vector = self.circuit_breaker.call(self.embed_with_retry, query)
+            if query_vector is None:
+                logger.warning("Query embedding failed, using fallback")
+                return self.documents[:k] if len(self.documents) >= k else self.documents
             
             # Fast cosine similarity
             similarities = []
@@ -96,9 +203,10 @@ class FinalOptimizedVectorStore:
             return self.documents[:k] if len(self.documents) >= k else self.documents
 
 def final_document_loader(url: str) -> List[Document]:
-    """Final optimized document loader"""
+    """Final optimized document loader with timeout handling"""
     try:
-        response = requests.get(url, timeout=8, headers={'User-Agent': 'Mozilla/5.0'})
+        # Faster timeout for quicker failure detection
+        response = requests.get(url, timeout=5, headers={'User-Agent': 'Mozilla/5.0'})
         response.raise_for_status()
         
         url_lower = url.lower()
@@ -107,16 +215,16 @@ def final_document_loader(url: str) -> List[Document]:
         if url_lower.endswith('.pdf') or 'pdf' in content_type:
             pdf_file = io.BytesIO(response.content)
             pdf_reader = PyPDF2.PdfReader(pdf_file)
-            total_pages = min(len(pdf_reader.pages), 25)
+            total_pages = min(len(pdf_reader.pages), 20)  # Reduced from 25
             
-            # Aggressive page sampling for speed
-            if total_pages <= 15:
+            # More aggressive page sampling for speed
+            if total_pages <= 10:
                 pages_to_process = list(range(total_pages))
             else:
-                # Minimal high-value pages
-                first_pages = list(range(8))  # First 8 pages
-                middle_pages = list(range(total_pages//2-2, total_pages//2+3))  # 5 middle pages
-                last_pages = list(range(total_pages-7, total_pages))  # Last 7 pages
+                # Even more selective sampling
+                first_pages = list(range(5))  # First 5 pages
+                middle_pages = list(range(total_pages//2-1, total_pages//2+2))  # 3 middle pages
+                last_pages = list(range(total_pages-5, total_pages))  # Last 5 pages
                 pages_to_process = sorted(set(first_pages + middle_pages + last_pages))
             
             text = ""
@@ -127,7 +235,7 @@ def final_document_loader(url: str) -> List[Document]:
                         text += page_text + "\n\n"
             
             logger.info(f"FINAL: Processed {len(pages_to_process)}/{total_pages} pages")
-            return [Document(page_content=text.strip()[:100000], metadata={"source": url, "type": "pdf"})]
+            return [Document(page_content=text.strip()[:80000], metadata={"source": url, "type": "pdf"})]  # Reduced from 100k
         
         else:
             soup = BeautifulSoup(response.content, 'html.parser')
@@ -136,7 +244,7 @@ def final_document_loader(url: str) -> List[Document]:
             text = soup.get_text()
             lines = (line.strip() for line in text.splitlines())
             text = '\n'.join(line for line in lines if line)
-            return [Document(page_content=text[:100000], metadata={"source": url, "type": "html"})]
+            return [Document(page_content=text[:80000], metadata={"source": url, "type": "html"})]  # Reduced from 100k
         
     except Exception as e:
         logger.error(f"Document load error: {e}")
@@ -149,6 +257,7 @@ class FinalRAGEngine:
         self.text_splitter = None
         self.initialized = False
         self.vectorstore_cache = {}
+        self.circuit_breaker = CircuitBreaker(failure_threshold=3, timeout=8)
     
     def initialize(self):
         if self.initialized:
@@ -165,13 +274,13 @@ class FinalRAGEngine:
             self.chat_model = ChatTogether(
                 model="meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo",
                 temperature=0,
-                max_tokens=2000
+                max_tokens=1800  # Reduced for faster response
             )
 
-            # Optimized chunking
+            # More aggressive chunking for speed
             self.text_splitter = RecursiveCharacterTextSplitter(
-                chunk_size=1400,
-                chunk_overlap=120,
+                chunk_size=1200,  # Reduced from 1400
+                chunk_overlap=100,  # Reduced from 120
                 separators=["\n\n", "\n", ". ", " "]
             )
 
@@ -182,10 +291,15 @@ class FinalRAGEngine:
             logger.error(f"Initialization error: {e}")
             raise
 
+    @with_smart_retry(max_retries=1, base_delay=0.2)
+    def _query_with_retry(self, messages):
+        """Chat query with retry"""
+        return self.chat_model.invoke(messages)
+
     def _final_query(self, vectorstore: FinalOptimizedVectorStore, query: str) -> str:
-        """FINAL QUERY - Better prompting to prevent question repetition"""
-        docs = vectorstore.similarity_search(query, k=7)
-        context = " ".join([doc.page_content for doc in docs])[:2500]
+        """FINAL QUERY with robust error handling"""
+        docs = vectorstore.similarity_search(query, k=6)  # Reduced from 7
+        context = " ".join([doc.page_content for doc in docs])[:2200]  # Reduced from 2500
         
         from langchain_core.messages import HumanMessage, SystemMessage
         
@@ -199,6 +313,7 @@ CRITICAL RULES:
 - DO NOT start answers with "Question:" or "Q:" or repeat the question
 - Extract specific facts, numbers, percentages, conditions from the document
 - If information not found, say "Information not available in document"
+- Keep answers concise but informative
 
 Example:
 Input: "What is the waiting period? | What is the sum insured?"
@@ -217,21 +332,29 @@ Provide only the answers separated by " | " (do not repeat questions):"""
             HumanMessage(content=human_content)
         ]
         
-        response = self.chat_model.invoke(messages)
-        return response.content
+        try:
+            response = self.circuit_breaker.call(self._query_with_retry, messages)
+            if response is None:
+                return "Service temporarily unavailable | " * query.count("|") + "Service temporarily unavailable"
+            return response.content
+        except Exception as e:
+            logger.error(f"Query error: {e}")
+            fallback_answer = "Information not available due to service error"
+            return " | ".join([fallback_answer] * (query.count("|") + 1))
 
     async def process_final(self, url: str, questions: List[str]) -> List[str]:
-        """FINAL PROCESSING - Guaranteed under 30 seconds"""
+        """FINAL PROCESSING - Guaranteed under 30 seconds with better error handling"""
         if not self.initialized:
             raise RuntimeError("RAG engine not initialized")
         
         try:
             return await asyncio.wait_for(
                 self._process_internal(url, questions),
-                timeout=28.0  # 28s timeout for safety
+                timeout=26.0  # Reduced timeout for safety margin
             )
         except asyncio.TimeoutError:
-            raise HTTPException(status_code=408, detail="28 second timeout exceeded")
+            logger.error("Timeout exceeded - returning fallback responses")
+            return ["Processing timeout - please try again"] * len(questions)
 
     async def _process_internal(self, url: str, questions: List[str]) -> List[str]:
         total_start = time.time()
@@ -245,25 +368,29 @@ Provide only the answers separated by " | " (do not repeat questions):"""
             docs = final_document_loader(url)
             chunks = self.text_splitter.split_documents(docs)
             
-            # FINAL OPTIMIZATION: Limit to 35 chunks max
-            if len(chunks) > 35:
+            # FINAL OPTIMIZATION: Limit to 30 chunks max (reduced from 35)
+            if len(chunks) > 30:
                 # Strategic selection: 40% start, 25% middle, 35% end
-                start_count = int(35 * 0.40)  # 14
-                middle_count = int(35 * 0.25)  # 8-9
-                end_count = 35 - start_count - middle_count  # 12-13
+                start_count = int(30 * 0.40)  # 12
+                middle_count = int(30 * 0.25)  # 7-8
+                end_count = 30 - start_count - middle_count  # 10-11
                 
                 middle_start = len(chunks) // 2 - middle_count // 2
                 chunks = (chunks[:start_count] + 
                          chunks[middle_start:middle_start + middle_count] + 
                          chunks[-end_count:])
                 
-                logger.info(f"FINAL: Selected 35/{len(chunks)} chunks")
+                logger.info(f"FINAL: Selected 30/{len(chunks)} chunks")
             
-            # Fast embedding
+            # Fast embedding with enhanced error handling
             vectorstore = FinalOptimizedVectorStore(self.embeddings)
             vectorstore.add_documents_final(chunks)
             
-            self.vectorstore_cache[url_hash] = vectorstore
+            # Only cache if we have sufficient embeddings
+            if len(vectorstore.documents) >= len(chunks) * 0.5:  # At least 50% success
+                self.vectorstore_cache[url_hash] = vectorstore
+            else:
+                logger.warning(f"Low embedding success rate: {len(vectorstore.documents)}/{len(chunks)}")
         
         # Query with timing
         batch_query = " | ".join(questions)
@@ -275,7 +402,7 @@ Provide only the answers separated by " | " (do not repeat questions):"""
         total_time = time.time() - total_start
         logger.info(f"FINAL: Query={query_time:.1f}s, Total={total_time:.1f}s")
         
-        # Clean answer parsing
+        # Enhanced answer parsing
         answers = []
         raw_splits = response.split(" | ")
         
@@ -283,10 +410,10 @@ Provide only the answers separated by " | " (do not repeat questions):"""
             cleaned = split.strip()
             # Remove any question repetition
             if cleaned and not any(q.lower().strip() in cleaned.lower() for q in questions):
-                if len(cleaned) > 8:  # Meaningful answers only
+                if len(cleaned) > 5:  # More lenient meaningful answer check
                     answers.append(cleaned)
         
-        # Ensure correct count
+        # Ensure correct count with better fallbacks
         while len(answers) < len(questions):
             answers.append("Information not available in document.")
         
@@ -319,7 +446,7 @@ async def ask_questions(
     request: QuestionRequest,
     authorization: str = Depends(verify_token)
 ):
-    """FINAL VERSION - Guaranteed under 30 seconds"""
+    """FINAL VERSION - Guaranteed under 30 seconds with robust error handling"""
     try:
         logger.info(f"FINAL: {len(request.questions)} questions - TARGET: <28s")
 
@@ -339,21 +466,24 @@ async def ask_questions(
         raise
     except Exception as e:
         logger.error(f"Processing error: {e}")
-        raise HTTPException(status_code=500, detail="Processing failed")
+        # Return graceful fallback instead of 500 error
+        fallback_answers = ["Service temporarily unavailable - please try again"] * len(request.questions)
+        return {"answers": fallback_answers}
 
 @app.get("/health")
 async def health_check():
     return {
         "status": "ready_for_submission",
-        "mode": "final_optimized",
+        "mode": "final_optimized_resilient",
         "model": "Meta-Llama-3.1-8B-Instruct-Turbo", 
-        "target_time": "<28_seconds",
-        "max_chunks": 35
+        "target_time": "<26_seconds",
+        "max_chunks": 30,
+        "features": ["circuit_breaker", "smart_retry", "fallback_strategies"]
     }
 
 @app.get("/")
 async def root():
-    return {"message": "FINAL RAG API - Ready for Submission"}
+    return {"message": "FINAL RAG API - Ready for Submission with Enhanced Resilience"}
 
 if __name__ == "__main__":
     import uvicorn
