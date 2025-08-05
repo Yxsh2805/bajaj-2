@@ -156,9 +156,9 @@ def final_document_loader(url: str) -> List[Document]:
             pdf = PyPDF2.PdfReader(io.BytesIO(r.content))
             pages = min(len(pdf.pages), 20)
             pick = list(range(pages)) if pages <= 10 else \
-                   sorted(set(range(5) +
-                              list(range(pages//2-1, pages//2+2)) +
-                              list(range(pages-5, pages))))
+                   sorted(set(list(range(5)) +                    # Convert to list
+                              list(range(pages//2-1, pages//2+2)) +  # Convert to list
+                              list(range(pages-5, pages))))           # Convert to list
             txt = ""
             for i in pick:
                 txt += (pdf.pages[i].extract_text() or "") + "\n\n"
@@ -176,6 +176,7 @@ def final_document_loader(url: str) -> List[Document]:
     except Exception as e:
         logger.error(f"Document load error: {e}")
         raise
+
 # ===========================================================
 
 
@@ -387,4 +388,5 @@ async def root():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
+
 
