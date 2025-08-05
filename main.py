@@ -23,7 +23,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from fastapi import FastAPI, HTTPException, Header, Depends
 from pydantic import BaseModel
-
+from typing import Optional
 # LangChain / Together
 from langchain_together import ChatTogether, TogetherEmbeddings
 from langchain_core.documents import Document
@@ -340,11 +340,17 @@ class FinalRAGEngine:
 # --------------- FastAPI glue ------------------------------
 rag = FinalRAGEngine()
 
-def verify_token(auth: Optional[str] = Header(None)):
-    if not auth or not auth.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Auth required")
-    if auth.split("Bearer ")[-1] != EXPECTED_TOKEN:
+
+
+
+def verify_token(authorization: Optional[str] = Header(None, alias="Authorization")):
+    if authorization is None or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Authorization required")
+
+    token = authorization.split("Bearer ", 1)[-1]
+    if token != EXPECTED_TOKEN:
         raise HTTPException(status_code=403, detail="Invalid token")
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -381,3 +387,4 @@ async def root():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
+
